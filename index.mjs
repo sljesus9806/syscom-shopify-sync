@@ -88,6 +88,20 @@ async function restPut(path, payload) {
   return data;
 }
 
+async function restPost(path, payload) {
+  const { data } = await axios.post(
+    `https://${SHOP}.myshopify.com/admin/api/2025-07/${path}`,
+    payload,
+    {
+      headers: {
+        "X-Shopify-Access-Token": ADMIN_TOKEN,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+  return data;
+}
+
 async function getPublicationId() {
   const q = `
     query {
@@ -121,20 +135,15 @@ async function findVariantBySku(sku) {
   return e.length ? e[0].node : null;
 }
 
-/* ====== crear producto con media opcional ====== */
-async function productCreate({ title, descriptionHtml, vendor, productType, images }) {
+/* ====== crear producto (sin depender de media GraphQL) ====== */
+async function productCreate({ title, descriptionHtml, vendor, productType }) {
   const q = `
-    mutation CreateProduct($product: ProductCreateInput!, $media: [CreateMediaInput!]) {
-      productCreate(product: $product, media: $media) {
+    mutation CreateProduct($product: ProductCreateInput!) {
+      productCreate(product: $product) {
         product { id variants(first: 1) { nodes { id inventoryItem { id } } } }
         userErrors { field message }
       }
     }`;
-  const media = (images || [])
-    .filter(Boolean)
-    .map((u) => ({ originalSource: u }))
-    .slice(0, 10);
-
   const product = {
     title,
     descriptionHtml: descriptionHtml || "",
@@ -142,8 +151,7 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
     productType: productType || "",
     status: "ACTIVE",
   };
-
-  const d = await gql(q, { product, media });
+  const d = await gql(q, { product });
   const e = d.productCreate.userErrors;
   if (e?.length) throw new Error(JSON.stringify(e));
   const p = d.productCreate.product;
@@ -154,7 +162,7 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
   };
 }
 
-/* ====== actualizar SOLO PRECIO por REST (seguro con Markets) ====== */
+/* ====== PRECIO por REST ====== */
 async function updateVariantPrice(_productId, variantGid, price) {
   if (!(price > 0)) return; // evita dejar $0.00
   const variantIdNum = Number(String(variantGid).replace(/\D/g, ""));
@@ -163,7 +171,7 @@ async function updateVariantPrice(_productId, variantGid, price) {
   });
 }
 
-/* ====== actualizar PESO por REST (en gramos) ====== */
+/* ====== PESO por REST (grams) ====== */
 async function updateVariantWeight(variantGid, weightKg) {
   if (!(weightKg > 0)) return;
   const variantIdNum = Number(String(variantGid).replace(/\D/g, ""));
@@ -171,7 +179,7 @@ async function updateVariantWeight(variantGid, weightKg) {
   await restPut(`variants/${variantIdNum}.json`, { variant: { id: variantIdNum, grams } });
 }
 
-/* ====== actualizar SKU + BARCODE en InventoryItem ====== */
+/* ====== SKU + BARCODE en InventoryItem ====== */
 async function setInventorySku(inventoryItemId, sku, barcode) {
   const q = `
     mutation InvItemUpdate($id: ID!, $input: InventoryItemInput!) {
@@ -184,6 +192,40 @@ async function setInventorySku(inventoryItemId, sku, barcode) {
   if (e?.length) throw new Error(JSON.stringify(e));
 }
 
+/* ====== IMÁGENES por REST ====== */
+function gidToNum(gid) { return Number(String(gid).replace(/\D/g, "")); }
+
+async function getProductImages(productGid) {
+  const idNum = gidToNum(productGid);
+  const d = await rest(`products/${idNum}.json`);
+  return Array.isArray(d?.product?.images) ? d.product.images : [];
+}
+
+async function ensureImages(productGid, urls = []) {
+  // Normaliza y limita a 5
+  const clean = (urls || [])
+    .map(u => (typeof u === "string" ? u.trim() : ""))
+    .filter(u => u && /^https?:\/\//i.test(u))
+    .slice(0, 5);
+
+  if (!clean.length) return;
+
+  const existing = await getProductImages(productGid);
+  if (existing.length > 0) return; // ya tiene imágenes, no duplicar
+
+  const idNum = gidToNum(productGid);
+  for (const src of clean) {
+    try {
+      await restPost(`products/${idNum}/images.json`, { image: { src } });
+      // un pequeño respiro por cortesía del rate limit
+      await wait(400);
+    } catch (e) {
+      if (DEBUG) console.log("Fallo subiendo imagen:", src, e?.response?.data || e?.message);
+    }
+  }
+}
+
+/* ====== INVENTARIO ====== */
 async function getAvailable(inventoryItemId, locationIdNum) {
   const iid = inventoryItemId.replace(/\D/g, "");
   const d = await rest(
@@ -243,20 +285,22 @@ function mapSyscomProduct(P) {
   let weightKg = firstNumber(P.peso_kg, P.peso);
   if (weightKg > 100) weightKg = weightKg / 1000;
 
+  // Recolecta varias URLs, no solo la primera
   const images = [];
+  const pushIf = (u) => { if (typeof u === "string" && /^https?:\/\//i.test(u)) images.push(u); };
   if (Array.isArray(P.imagenes)) {
     for (const img of P.imagenes) {
-      if (typeof img === "string") { images.push(img); break; }
-      if (img?.url)               { images.push(img.url); break; }
+      if (typeof img === "string") pushIf(img);
+      else if (img?.url)          pushIf(img.url);
     }
-  } else if (Array.isArray(P.fotos)) {
-    for (const img of P.fotos) {
-      if (typeof img === "string") { images.push(img); break; }
-      if (img?.url)               { images.push(img.url); break; }
-    }
-  } else if (typeof P.img_portada === "string") {
-    images.push(P.img_portada);
   }
+  if (Array.isArray(P.fotos)) {
+    for (const img of P.fotos) {
+      if (typeof img === "string") pushIf(img);
+      else if (img?.url)          pushIf(img.url);
+    }
+  }
+  if (typeof P.img_portada === "string") pushIf(P.img_portada);
 
   const barcode =
     P.codigo_barras || P.codigo_barras_ean || P.ean || P.barcode || P.gtin || P.upc || null;
@@ -269,7 +313,7 @@ function mapSyscomProduct(P) {
     productType: String(ptype),
     price: Number(price) || 0,
     available: Number(qty) || 0,
-    images,
+    images: images.slice(0, 8), // límite razonable
     barcode,
     weightKg: Number(weightKg) || 0,
   };
@@ -353,6 +397,7 @@ async function main() {
           await updateVariantWeight(exists.id, m.weightKg);
           await setInventorySku(exists.inventoryItem.id, m.sku, m.barcode);
           await adjustInventory(exists.inventoryItem.id, location, m.available);
+          await ensureImages(exists.product.id, m.images);
           await publishProduct(exists.product.id, publicationId);
           updated++;
         } else {
@@ -361,12 +406,12 @@ async function main() {
             descriptionHtml: m.descriptionHtml,
             vendor: m.vendor,
             productType: m.productType,
-            images: m.images,
           });
           await updateVariantPrice(res.productId, res.variantId, m.price);
           await updateVariantWeight(res.variantId, m.weightKg);
           await setInventorySku(res.inventoryItemId, m.sku, m.barcode);
           await adjustInventory(res.inventoryItemId, location, m.available);
+          await ensureImages(res.productId, m.images);
           await publishProduct(res.productId, publicationId);
           created++;
         }
