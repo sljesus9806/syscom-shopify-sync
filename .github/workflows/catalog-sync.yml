@@ -24,3 +24,5 @@ jobs:
           SYSCOM_QUERY:         ${{ secrets.SYSCOM_QUERY }}
           RUN_PAGES:            ${{ secrets.RUN_PAGES }}
           SLEEP_MS:             ${{ secrets.SLEEP_MS }}
+          DEBUG:               ${{ vars.DEBUG }}
+          SYSCOM_ONLY_STOCK:   ${{ vars.SYSCOM_ONLY_STOCK }}
