@@ -21,6 +21,14 @@ const SYS_BASE  = "https://developers.syscom.mx/api/v1";
 /* ================== UTILS ================== */
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
+function firstNumber(...vals) {
+  for (const v of vals) {
+    if (typeof v === "number" && isFinite(v)) return v;
+    if (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v))) return Number(v);
+  }
+  return 0;
+}
+
 /* ================== SYSCOM HELPERS ================== */
 async function syscomToken() {
   const body = new URLSearchParams({
@@ -62,6 +70,20 @@ async function rest(path) {
   const { data } = await axios.get(
     `https://${SHOP}.myshopify.com/admin/api/2025-07/${path}`,
     { headers: { "X-Shopify-Access-Token": ADMIN_TOKEN } }
+  );
+  return data;
+}
+
+async function restPut(path, payload) {
+  const { data } = await axios.put(
+    `https://${SHOP}.myshopify.com/admin/api/2025-07/${path}`,
+    payload,
+    {
+      headers: {
+        "X-Shopify-Access-Token": ADMIN_TOKEN,
+        "Content-Type": "application/json",
+      },
+    }
   );
   return data;
 }
@@ -132,34 +154,40 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
   };
 }
 
-/* ====== actualizar precio + barcode + peso de la variante ====== */
-async function updateVariantDetails(productId, variantId, { price, barcode, weightKg }) {
+/* ====== actualizar SOLO PRECIO por GraphQL ====== */
+async function updateVariantPrice(productId, variantId, price) {
+  if (!(price > 0)) return; // evita poner precio 0
   const q = `
     mutation UpdateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
       productVariantsBulkUpdate(productId: $productId, variants: $variants) {
         userErrors { field message }
       }
     }`;
-
-  const upd = { id: variantId };
-  if (price != null)   upd.price = String(price);
-  if (barcode)         upd.barcode = String(barcode);
-  if (weightKg && weightKg > 0) {
-    upd.weight = Number(weightKg);
-    upd.weightUnit = "KILOGRAMS";
-  }
-
-  const d = await gql(q, { productId, variants: [upd] });
+  const d = await gql(q, {
+    productId,
+    variants: [{ id: variantId, price: String(price) }],
+  });
   const e = d.productVariantsBulkUpdate.userErrors;
   if (e?.length) throw new Error(JSON.stringify(e));
 }
 
-async function setInventorySku(inventoryItemId, sku) {
+/* ====== actualizar PESO por REST (en gramos) ====== */
+async function updateVariantWeight(variantGid, weightKg) {
+  if (!(weightKg > 0)) return;
+  const variantIdNum = Number(String(variantGid).replace(/\D/g, ""));
+  const grams = Math.max(0, Math.round(Number(weightKg) * 1000));
+  await restPut(`variants/${variantIdNum}.json`, { variant: { id: variantIdNum, grams } });
+}
+
+/* ====== actualizar SKU + BARCODE en InventoryItem ====== */
+async function setInventorySku(inventoryItemId, sku, barcode) {
   const q = `
     mutation InvItemUpdate($id: ID!, $input: InventoryItemInput!) {
       inventoryItemUpdate(id: $id, input: $input) { userErrors { field message } }
     }`;
-  const d = await gql(q, { id: inventoryItemId, input: { sku, tracked: true } });
+  const input = { sku: String(sku), tracked: true };
+  if (barcode) input.barcode = String(barcode);
+  const d = await gql(q, { id: inventoryItemId, input });
   const e = d.inventoryItemUpdate.userErrors;
   if (e?.length) throw new Error(JSON.stringify(e));
 }
@@ -202,12 +230,10 @@ async function publishProduct(productId, publicationId) {
 
 /* ================== MAPEO DESDE SYSCOM ================== */
 function mapSyscomProduct(P) {
-  // SKU y título
   const sku   = P.sku || P.codigo || P.clave || P.modelo;
   const title = P.nombre || P.titulo || P.descripcion_corta || P.descripcion;
   if (!sku || !title) return null;
 
-  // descripción / marca / categoría
   const desc   = P.descripcion_html || P.descripcion || "";
   const vendor = (P.marca && (P.marca.nombre || P.marca)) || P.marca || P.fabricante || "";
   const ptype  =
@@ -215,50 +241,33 @@ function mapSyscomProduct(P) {
     (P.categoria && (P.categoria.nombre || P.categoria)) ||
     "";
 
-  // precio: considerar objeto "precios"
-  let price =
-    P.precio ??
-    P.precio_publico ??
-    P.precio_lista ??
-    (P.precios && (P.precios.publico ?? P.precios.precio ?? P.precios.lista)) ??
-    0;
+  const price = firstNumber(
+    P.precios?.publico, P.precios?.precio, P.precios?.lista,
+    P.precio, P.precio_publico, P.precio_lista
+  );
 
-  // existencias totales
-  const qty =
-    P.existencia ??
-    P.stock ??
-    P.total_existencia ??
-    0;
+  const qty = firstNumber(P.existencia, P.stock, P.total_existencia);
 
-  // peso (si viene en gramos, lo normalizamos a kg)
-  let weight_kg = P.peso_kg ?? P.peso ?? 0;
-  if (weight_kg > 100) weight_kg = weight_kg / 1000;
+  let weightKg = firstNumber(P.peso_kg, P.peso);
+  if (weightKg > 100) weightKg = weightKg / 1000;
 
-  // imágenes: imágenes[] / fotos[] / img_portada
   const images = [];
   if (Array.isArray(P.imagenes)) {
     for (const img of P.imagenes) {
       if (typeof img === "string") { images.push(img); break; }
-      if (img?.url)                 { images.push(img.url); break; }
+      if (img?.url)               { images.push(img.url); break; }
     }
   } else if (Array.isArray(P.fotos)) {
     for (const img of P.fotos) {
       if (typeof img === "string") { images.push(img); break; }
-      if (img?.url)                 { images.push(img.url); break; }
+      if (img?.url)               { images.push(img.url); break; }
     }
   } else if (typeof P.img_portada === "string") {
     images.push(P.img_portada);
   }
 
-  // más alias de código de barras
   const barcode =
-    P.codigo_barras ||
-    P.codigo_barras_ean ||
-    P.ean ||
-    P.barcode ||
-    P.gtin ||
-    P.upc ||
-    null;
+    P.codigo_barras || P.codigo_barras_ean || P.ean || P.barcode || P.gtin || P.upc || null;
 
   return {
     sku: String(sku),
@@ -270,7 +279,7 @@ function mapSyscomProduct(P) {
     available: Number(qty) || 0,
     images,
     barcode,
-    weightKg: Number(weight_kg) || 0,
+    weightKg: Number(weightKg) || 0,
   };
 }
 
@@ -330,12 +339,8 @@ async function main() {
       try {
         const row = p.producto || p.Producto || p.item || p.Item || p;
 
-        // ID del producto
         let pid =
-          row.id ||
-          row.producto_id ||
-          row.id_producto ||
-          row.pid;
+          row.id || row.producto_id || row.id_producto || row.pid;
 
         if (!pid) {
           const u = row.url || row.link || row.href || "";
@@ -344,7 +349,6 @@ async function main() {
         }
         if (!pid) { if (DEBUG) console.log("Sin pid en item:", Object.keys(row || {})); continue; }
 
-        // Detalle
         const det = await sysget(token, `/productos/${pid}`, {});
         const sp  = det.data || det;
 
@@ -353,12 +357,9 @@ async function main() {
 
         const exists = await findVariantBySku(m.sku);
         if (exists) {
-          await updateVariantDetails(exists.product.id, exists.id, {
-            price: m.price,
-            barcode: m.barcode,
-            weightKg: m.weightKg,
-          });
-          await setInventorySku(exists.inventoryItem.id, m.sku);
+          await updateVariantPrice(exists.product.id, exists.id, m.price);
+          await updateVariantWeight(exists.id, m.weightKg);
+          await setInventorySku(exists.inventoryItem.id, m.sku, m.barcode);
           await adjustInventory(exists.inventoryItem.id, location, m.available);
           await publishProduct(exists.product.id, publicationId);
           updated++;
@@ -370,12 +371,9 @@ async function main() {
             productType: m.productType,
             images: m.images,
           });
-          await updateVariantDetails(res.productId, res.variantId, {
-            price: m.price,
-            barcode: m.barcode,
-            weightKg: m.weightKg,
-          });
-          await setInventorySku(res.inventoryItemId, m.sku);
+          await updateVariantPrice(res.productId, res.variantId, m.price);
+          await updateVariantWeight(res.variantId, m.weightKg);
+          await setInventorySku(res.inventoryItemId, m.sku, m.barcode);
           await adjustInventory(res.inventoryItemId, location, m.available);
           await publishProduct(res.productId, publicationId);
           created++;
