@@ -1,0 +1,26 @@
+name: Syscom → Shopify sync
+
+on:
+  schedule:
+    - cron: "0 */2 * * *"   # cada 2 horas
+  workflow_dispatch: {}     # correr a mano
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+      - run: npm ci || npm i
+      - run: node index.mjs
+        env:
+          SHOP:                 ${{ secrets.SHOP }}
+          ADMIN_TOKEN:          ${{ secrets.ADMIN_TOKEN }}
+          SYSCOM_CLIENT_ID:     ${{ secrets.SYSCOM_CLIENT_ID }}
+          SYSCOM_CLIENT_SECRET: ${{ secrets.SYSCOM_CLIENT_SECRET }}
+          SYSCOM_MODE:          ${{ secrets.SYSCOM_MODE }}
+          SYSCOM_QUERY:         ${{ secrets.SYSCOM_QUERY }}
+          RUN_PAGES:            ${{ secrets.RUN_PAGES }}
+          SLEEP_MS:             ${{ secrets.SLEEP_MS }}
