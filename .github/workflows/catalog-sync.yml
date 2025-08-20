@@ -2,7 +2,7 @@ name: Syscom → Shopify sync
 
 on:
   schedule:
-    - cron: "0 */2 * * *"   # cada 2 horas
+    - cron: "2 */2 * * *"   # cada 2 horas
   workflow_dispatch: {}     # correr a mano
 
 jobs:
