@@ -1,6 +1,6 @@
 import axios from "axios";
 
-/* ================== VARIABLES DE ENTORNO ================== */
+/* ================== VARS ================== */
 const SHOP                 = process.env.SHOP;
 const ADMIN_TOKEN          = process.env.ADMIN_TOKEN;
 const SYSCOM_CLIENT_ID     = process.env.SYSCOM_CLIENT_ID;
@@ -11,22 +11,69 @@ const QUERY     = process.env.SYSCOM_QUERY || "camaras";
 const RUN_PAGES = parseInt(process.env.RUN_PAGES || "2", 10);
 const SLEEP_MS  = parseInt(process.env.SLEEP_MS  || "900", 10);
 
-const DEBUG      = process.env.DEBUG === "1";
-const ONLY_STOCK = process.env.SYSCOM_ONLY_STOCK !== "0"; // true = solo con stock
+const DEBUG        = process.env.DEBUG === "1";
+const LOG_PRICES   = process.env.LOG_PRICES === "1";
+const ONLY_STOCK   = process.env.SYSCOM_ONLY_STOCK !== "0";
+const FORCE_IMAGES = process.env.FORCE_IMAGES === "1";
 
-/* ================== ENDPOINTS SYSCOM ================== */
+/* ================== SYSCOM ================== */
 const SYS_OAUTH = "https://developers.syscom.mx/oauth/token";
 const SYS_BASE  = "https://developers.syscom.mx/api/v1";
 
 /* ================== UTILS ================== */
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
-
+const gidToNum = (gid) => Number(String(gid).replace(/\D/g, ""));
 function firstNumber(...vals) {
   for (const v of vals) {
     if (typeof v === "number" && isFinite(v)) return v;
     if (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v))) return Number(v);
   }
   return 0;
+}
+
+/* ========== Precio robusto desde Syscom ========== */
+function extractPriceFromSyscom(P) {
+  // 1) atajos comunes
+  let direct = firstNumber(
+    P?.precios?.publico, P?.precios?.precio, P?.precios?.lista,
+    P?.precio, P?.precio_publico, P?.precio_lista
+  );
+  if (direct > 0) return direct;
+
+  // 2) escaneo profundo de P.precios (objeto o array)
+  const candidates = [];
+  function scan(obj, path = []) {
+    if (!obj || typeof obj !== "object") return;
+    for (const [k, v] of Object.entries(obj)) {
+      const key = (k || "").toLowerCase();
+      const nextPath = [...path, k];
+      if (typeof v === "number" || (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v)))) {
+        const num = Number(v);
+        if (num > 0) {
+          // scoring: favorece "publico" > "lista" > "precio"
+          let score = 0;
+          if (key.includes("public")) score += 30;
+          if (key.includes("lista"))   score += 20;
+          if (key.includes("precio"))  score += 10;
+          if (key.includes("mxn"))     score += 3;
+          candidates.push({ num, score, path: nextPath.join(".") });
+        }
+      } else if (typeof v === "object") {
+        scan(v, nextPath);
+      }
+    }
+  }
+  scan(P?.precios);
+
+  if (!candidates.length) return 0;
+
+  // ordena por score y, a igualdad, por valor más alto
+  candidates.sort((a, b) => b.score - a.score || b.num - a.num);
+  if (LOG_PRICES) {
+    console.log("Precio elegido:", candidates[0].num, "de", candidates[0].path);
+    if (DEBUG) console.log("Candidatos precio (top 5):", candidates.slice(0, 5));
+  }
+  return candidates[0].num;
 }
 
 /* ================== SYSCOM HELPERS ================== */
@@ -41,7 +88,6 @@ async function syscomToken() {
   });
   return data.access_token;
 }
-
 async function sysget(token, path, params = {}) {
   const { data } = await axios.get(SYS_BASE + path, {
     headers: { Authorization: `Bearer ${token}` },
@@ -65,7 +111,6 @@ async function gql(query, variables = {}) {
   if (data.errors) throw new Error(JSON.stringify(data.errors));
   return data.data;
 }
-
 async function rest(path) {
   const { data } = await axios.get(
     `https://${SHOP}.myshopify.com/admin/api/2025-07/${path}`,
@@ -73,7 +118,6 @@ async function rest(path) {
   );
   return data;
 }
-
 async function restPut(path, payload) {
   const { data } = await axios.put(
     `https://${SHOP}.myshopify.com/admin/api/2025-07/${path}`,
@@ -87,7 +131,6 @@ async function restPut(path, payload) {
   );
   return data;
 }
-
 async function restPost(path, payload) {
   const { data } = await axios.post(
     `https://${SHOP}.myshopify.com/admin/api/2025-07/${path}`,
@@ -101,6 +144,13 @@ async function restPost(path, payload) {
   );
   return data;
 }
+async function restDelete(path) {
+  const { data } = await axios.delete(
+    `https://${SHOP}.myshopify.com/admin/api/2025-07/${path}`,
+    { headers: { "X-Shopify-Access-Token": ADMIN_TOKEN } }
+  );
+  return data;
+}
 
 async function getPublicationId() {
   const q = `
@@ -111,16 +161,14 @@ async function getPublicationId() {
     }`;
   const d = await gql(q);
   if (!d.publications.edges.length) throw new Error("No hay publications");
-  return d.publications.edges[0].node.id; // usualmente Online Store
+  return d.publications.edges[0].node.id;
 }
-
 async function getLocation() {
   const d = await rest("locations.json");
   if (!d.locations?.length) throw new Error("No hay locations activas");
   const loc = d.locations[0];
   return { gid: `gid://shopify/Location/${loc.id}`, id: String(loc.id) };
 }
-
 async function findVariantBySku(sku) {
   const q = `
     query ($q: String!) {
@@ -135,7 +183,7 @@ async function findVariantBySku(sku) {
   return e.length ? e[0].node : null;
 }
 
-/* ====== crear producto (sin depender de media GraphQL) ====== */
+/* ====== CREAR PRODUCTO ====== */
 async function productCreate({ title, descriptionHtml, vendor, productType }) {
   const q = `
     mutation CreateProduct($product: ProductCreateInput!) {
@@ -162,24 +210,24 @@ async function productCreate({ title, descriptionHtml, vendor, productType }) {
   };
 }
 
-/* ====== PRECIO por REST ====== */
+/* ====== PRECIO (REST) ====== */
 async function updateVariantPrice(_productId, variantGid, price) {
-  if (!(price > 0)) return; // evita dejar $0.00
-  const variantIdNum = Number(String(variantGid).replace(/\D/g, ""));
-  await restPut(`variants/${variantIdNum}.json`, {
-    variant: { id: variantIdNum, price: String(Number(price).toFixed(2)) },
+  if (!(price > 0)) return;
+  const id = gidToNum(variantGid);
+  await restPut(`variants/${id}.json`, {
+    variant: { id, price: String(Number(price).toFixed(2)) },
   });
 }
 
-/* ====== PESO por REST (grams) ====== */
+/* ====== PESO (REST grams) ====== */
 async function updateVariantWeight(variantGid, weightKg) {
   if (!(weightKg > 0)) return;
-  const variantIdNum = Number(String(variantGid).replace(/\D/g, ""));
+  const id = gidToNum(variantGid);
   const grams = Math.max(0, Math.round(Number(weightKg) * 1000));
-  await restPut(`variants/${variantIdNum}.json`, { variant: { id: variantIdNum, grams } });
+  await restPut(`variants/${id}.json`, { variant: { id, grams } });
 }
 
-/* ====== SKU + BARCODE en InventoryItem ====== */
+/* ====== SKU + BARCODE ====== */
 async function setInventorySku(inventoryItemId, sku, barcode) {
   const q = `
     mutation InvItemUpdate($id: ID!, $input: InventoryItemInput!) {
@@ -192,32 +240,42 @@ async function setInventorySku(inventoryItemId, sku, barcode) {
   if (e?.length) throw new Error(JSON.stringify(e));
 }
 
-/* ====== IMÁGENES por REST ====== */
-function gidToNum(gid) { return Number(String(gid).replace(/\D/g, "")); }
-
+/* ====== IMÁGENES (REST) ====== */
 async function getProductImages(productGid) {
-  const idNum = gidToNum(productGid);
-  const d = await rest(`products/${idNum}.json`);
+  const id = gidToNum(productGid);
+  const d = await rest(`products/${id}.json`);
   return Array.isArray(d?.product?.images) ? d.product.images : [];
 }
-
+function normUrl(u) {
+  if (typeof u !== "string") return "";
+  let s = u.trim();
+  if (!s) return "";
+  return s.replace(/^http:\/\//i, "https://");
+}
 async function ensureImages(productGid, urls = []) {
-  // Normaliza y limita a 5
   const clean = (urls || [])
-    .map(u => (typeof u === "string" ? u.trim() : ""))
+    .map(normUrl)
     .filter(u => u && /^https?:\/\//i.test(u))
     .slice(0, 5);
-
   if (!clean.length) return;
 
-  const existing = await getProductImages(productGid);
-  if (existing.length > 0) return; // ya tiene imágenes, no duplicar
+  const id = gidToNum(productGid);
+  let existing = await getProductImages(productGid);
 
-  const idNum = gidToNum(productGid);
+  if (existing.length > 0 && FORCE_IMAGES) {
+    for (const img of existing) {
+      try { await restDelete(`products/${id}/images/${img.id}.json`); }
+      catch (e) { if (DEBUG) console.log("No se pudo borrar imagen:", e?.response?.data || e?.message); }
+      await wait(250);
+    }
+    existing = [];
+  }
+  if (existing.length > 0) return;
+
   for (const src of clean) {
     try {
-      await restPost(`products/${idNum}/images.json`, { image: { src } });
-      // un pequeño respiro por cortesía del rate limit
+      await restPost(`products/${id}/images.json`, { image: { src } });
+      if (DEBUG) console.log("Imagen subida:", src);
       await wait(400);
     } catch (e) {
       if (DEBUG) console.log("Fallo subiendo imagen:", src, e?.response?.data || e?.message);
@@ -233,7 +291,6 @@ async function getAvailable(inventoryItemId, locationIdNum) {
   );
   return d.inventory_levels?.[0]?.available ?? 0;
 }
-
 async function adjustInventory(inventoryItemId, location, targetQty) {
   const current = await getAvailable(inventoryItemId, location.id);
   const delta = Number(targetQty) - Number(current);
@@ -251,7 +308,6 @@ async function adjustInventory(inventoryItemId, location, targetQty) {
   const e = d.inventoryAdjustQuantities.userErrors;
   if (e?.length) throw new Error(JSON.stringify(e));
 }
-
 async function publishProduct(productId, publicationId) {
   const q = `
     mutation Pub($id: ID!, $input: [PublicationInput!]!) {
@@ -262,7 +318,7 @@ async function publishProduct(productId, publicationId) {
   if (e?.length) throw new Error(JSON.stringify(e));
 }
 
-/* ================== MAPEO DESDE SYSCOM ================== */
+/* ================== MAPEO ================== */
 function mapSyscomProduct(P) {
   const sku   = P.sku || P.codigo || P.clave || P.modelo;
   const title = P.nombre || P.titulo || P.descripcion_corta || P.descripcion;
@@ -275,31 +331,16 @@ function mapSyscomProduct(P) {
     (P.categoria && (P.categoria.nombre || P.categoria)) ||
     "";
 
-  const price = firstNumber(
-    P.precios?.publico, P.precios?.precio, P.precios?.lista,
-    P.precio, P.precio_publico, P.precio_lista
-  );
-
-  const qty = firstNumber(P.existencia, P.stock, P.total_existencia);
+  const price = extractPriceFromSyscom(P);
+  const qty   = firstNumber(P.existencia, P.stock, P.total_existencia);
 
   let weightKg = firstNumber(P.peso_kg, P.peso);
   if (weightKg > 100) weightKg = weightKg / 1000;
 
-  // Recolecta varias URLs, no solo la primera
   const images = [];
-  const pushIf = (u) => { if (typeof u === "string" && /^https?:\/\//i.test(u)) images.push(u); };
-  if (Array.isArray(P.imagenes)) {
-    for (const img of P.imagenes) {
-      if (typeof img === "string") pushIf(img);
-      else if (img?.url)          pushIf(img.url);
-    }
-  }
-  if (Array.isArray(P.fotos)) {
-    for (const img of P.fotos) {
-      if (typeof img === "string") pushIf(img);
-      else if (img?.url)          pushIf(img.url);
-    }
-  }
+  const pushIf = (u) => { const nu = normUrl(u); if (nu) images.push(nu); };
+  if (Array.isArray(P.imagenes)) for (const img of P.imagenes) (typeof img === "string") ? pushIf(img) : img?.url && pushIf(img.url);
+  if (Array.isArray(P.fotos))    for (const img of P.fotos)    (typeof img === "string") ? pushIf(img) : img?.url && pushIf(img.url);
   if (typeof P.img_portada === "string") pushIf(P.img_portada);
 
   const barcode =
@@ -313,7 +354,7 @@ function mapSyscomProduct(P) {
     productType: String(ptype),
     price: Number(price) || 0,
     available: Number(qty) || 0,
-    images: images.slice(0, 8), // límite razonable
+    images: images.slice(0, 8),
     barcode,
     weightKg: Number(weightKg) || 0,
   };
@@ -352,20 +393,11 @@ async function main() {
     const productos = list?.data?.productos || list?.data || list?.productos || list;
 
     if (DEBUG) {
-      console.log(
-        `Página ${page}: ${Array.isArray(productos) ? productos.length : 0} productos`
-      );
+      console.log(`Página ${page}: ${Array.isArray(productos) ? productos.length : 0} productos`);
       if (Array.isArray(productos) && productos.length) {
         const first = productos[0]?.producto || productos[0]?.Producto || productos[0]?.item || productos[0]?.Item || productos[0];
         console.log("Keys ejemplo (nivel 1):", first ? Object.keys(first) : "sin items");
         try { console.log("Ejemplo JSON (recortado):", JSON.stringify(first).slice(0, 800)); } catch {}
-        console.log(
-          "Muestra:",
-          productos.slice(0, 3).map((pp) => {
-            const r = pp.producto || pp.Producto || pp.item || pp.Item || pp;
-            return r.sku || r.codigo || r.clave || r.modelo || r.pid || r.id || r.id_producto;
-          })
-        );
       }
     }
 
@@ -375,9 +407,7 @@ async function main() {
       try {
         const row = p.producto || p.Producto || p.item || p.Item || p;
 
-        let pid =
-          row.id || row.producto_id || row.id_producto || row.pid;
-
+        let pid = row.id || row.producto_id || row.id_producto || row.pid;
         if (!pid) {
           const u = row.url || row.link || row.href || "";
           const m = typeof u === "string" ? u.match(/productos\/(\d+)/) : null;
@@ -431,7 +461,7 @@ async function main() {
   console.log(`Resumen => creados: ${created}, actualizados: ${updated}, errores: ${errors}`);
 }
 
-/* ================== ARRANQUE ================== */
+/* ================== RUN ================== */
 main().catch((e) => {
   console.error(e?.response?.data || e?.message || e);
   process.exit(1);
