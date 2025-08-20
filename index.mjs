@@ -12,8 +12,8 @@ const RUN_PAGES = parseInt(process.env.RUN_PAGES || "2", 10);
 const SLEEP_MS  = parseInt(process.env.SLEEP_MS  || "900", 10);
 
 // Debug y filtro de stock (puedes controlarlos con Variables del workflow)
-const DEBUG          = process.env.DEBUG === "1";
-const ONLY_STOCK     = process.env.SYSCOM_ONLY_STOCK !== "0"; // true = solo con stock
+const DEBUG      = process.env.DEBUG === "1";
+const ONLY_STOCK = process.env.SYSCOM_ONLY_STOCK !== "0"; // true = solo con stock
 
 // ====== ENDPOINTS SYSCOM ======
 const SYS_OAUTH = "https://developers.syscom.mx/oauth/token";
@@ -193,14 +193,14 @@ async function publishProduct(productId, publicationId) {
 
 // ====== MAPEO DESDE SYSCOM ======
 function mapSyscomProduct(P) {
-  const sku   = P.sku || P.codigo;
-  const title = P.nombre || P.titulo;
+  const sku   = P.sku || P.codigo || P.clave || P.modelo;
+  const title = P.nombre || P.titulo || P.descripcion_corta || P.descripcion;
   if (!sku || !title) return null;
 
   const desc   = P.descripcion_html || P.descripcion || "";
-  const vendor = P.marca?.nombre || P.marca || "";
-  const ptype  = P.categoria?.nombre || P.categoria || "";
-  const price  = P.precio ?? P.precio_publico ?? 0;
+  const vendor = (P.marca && (P.marca.nombre || P.marca)) || P.fabricante || "";
+  const ptype  = (P.categoria && (P.categoria.nombre || P.categoria)) || "";
+  const price  = P.precio ?? P.precio_publico ?? P.precio_lista ?? 0;
   const qty    = P.existencia ?? P.stock ?? 0;
 
   let weight_kg = P.peso_kg ?? P.peso ?? 0;
@@ -209,6 +209,11 @@ function mapSyscomProduct(P) {
   const images = [];
   if (Array.isArray(P.imagenes)) {
     for (const img of P.imagenes) {
+      if (typeof img === "string") { images.push(img); break; }
+      if (img?.url)                 { images.push(img.url); break; }
+    }
+  } else if (Array.isArray(P.fotos)) {
+    for (const img of P.fotos) {
       if (typeof img === "string") { images.push(img); break; }
       if (img?.url)                 { images.push(img.url); break; }
     }
@@ -263,15 +268,28 @@ async function main() {
     const productos =
       list?.data?.productos || list?.data || list?.productos || list;
 
-    // DEBUG
+    // DEBUG de forma de respuesta y primer item
+    if (DEBUG) {
+      console.log("Shape respuesta top-level:", Object.keys(list || {}));
+    }
+
+    // DEBUG conteo + muestra (flexible)
     if (DEBUG) {
       console.log(
         `Página ${page}: ${Array.isArray(productos) ? productos.length : 0} productos`
       );
-      if (Array.isArray(productos)) {
+      if (Array.isArray(productos) && productos.length) {
+        const first = productos[0]?.producto || productos[0]?.Producto || productos[0]?.item || productos[0]?.Item || productos[0];
+        console.log("Keys ejemplo (nivel 1):", first ? Object.keys(first) : "sin items");
+        try {
+          console.log("Ejemplo JSON (recortado):", JSON.stringify(first).slice(0, 800));
+        } catch {}
         console.log(
           "Muestra:",
-          productos.slice(0, 3).map((p) => p.sku || p.codigo || p.pid || p.id)
+          productos.slice(0, 3).map((pp) => {
+            const r = pp.producto || pp.Producto || pp.item || pp.Item || pp;
+            return r.sku || r.codigo || r.clave || r.modelo || r.pid || r.id || r.id_producto;
+          })
         );
       }
     }
@@ -280,8 +298,27 @@ async function main() {
 
     for (const p of productos) {
       try {
-        const pid = p.id || p.producto_id || p.pid; // aceptar 'pid'
-        if (!pid) continue;
+        // Muchos listados vienen anidados
+        const row = p.producto || p.Producto || p.item || p.Item || p;
+
+        // Intentamos obtener el ID de varias formas
+        let pid =
+          row.id ||
+          row.producto_id ||
+          row.id_producto ||
+          row.pid;
+
+        // A veces el ID viene en una URL tipo ".../productos/12345"
+        if (!pid) {
+          const u = row.url || row.link || row.href || "";
+          const m = typeof u === "string" ? u.match(/productos\/(\d+)/) : null;
+          if (m) pid = m[1];
+        }
+
+        if (!pid) {
+          if (DEBUG) console.log("Sin pid en item, keys:", Object.keys(row || {}));
+          continue;
+        }
 
         const det = await sysget(token, `/productos/${pid}`, {});
         const sp  = det.data || det;
