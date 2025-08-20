@@ -1,6 +1,6 @@
 import axios from "axios";
 
-// ====== VARIABLES DE ENTORNO ======
+/* ================== VARIABLES DE ENTORNO ================== */
 const SHOP                 = process.env.SHOP;
 const ADMIN_TOKEN          = process.env.ADMIN_TOKEN;
 const SYSCOM_CLIENT_ID     = process.env.SYSCOM_CLIENT_ID;
@@ -11,18 +11,17 @@ const QUERY     = process.env.SYSCOM_QUERY || "camaras";
 const RUN_PAGES = parseInt(process.env.RUN_PAGES || "2", 10);
 const SLEEP_MS  = parseInt(process.env.SLEEP_MS  || "900", 10);
 
-// Debug y filtro de stock (puedes controlarlos con Variables del workflow)
 const DEBUG      = process.env.DEBUG === "1";
 const ONLY_STOCK = process.env.SYSCOM_ONLY_STOCK !== "0"; // true = solo con stock
 
-// ====== ENDPOINTS SYSCOM ======
+/* ================== ENDPOINTS SYSCOM ================== */
 const SYS_OAUTH = "https://developers.syscom.mx/oauth/token";
 const SYS_BASE  = "https://developers.syscom.mx/api/v1";
 
-// Utilidad para esperar
+/* ================== UTILS ================== */
 const wait = (ms) => new Promise((r) => setTimeout(r, ms));
 
-// ====== SYSCOM HELPERS ======
+/* ================== SYSCOM HELPERS ================== */
 async function syscomToken() {
   const body = new URLSearchParams({
     grant_type: "client_credentials",
@@ -43,7 +42,7 @@ async function sysget(token, path, params = {}) {
   return data;
 }
 
-// ====== SHOPIFY HELPERS ======
+/* ================== SHOPIFY HELPERS ================== */
 async function gql(query, variables = {}) {
   const { data } = await axios.post(
     `https://${SHOP}.myshopify.com/admin/api/2025-07/graphql.json`,
@@ -100,6 +99,7 @@ async function findVariantBySku(sku) {
   return e.length ? e[0].node : null;
 }
 
+/* ====== crear producto con media opcional ====== */
 async function productCreate({ title, descriptionHtml, vendor, productType, images }) {
   const q = `
     mutation CreateProduct($product: ProductCreateInput!, $media: [CreateMediaInput!]) {
@@ -112,6 +112,7 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
     .filter(Boolean)
     .map((u) => ({ originalSource: u }))
     .slice(0, 10);
+
   const product = {
     title,
     descriptionHtml: descriptionHtml || "",
@@ -119,6 +120,7 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
     productType: productType || "",
     status: "ACTIVE",
   };
+
   const d = await gql(q, { product, media });
   const e = d.productCreate.userErrors;
   if (e?.length) throw new Error(JSON.stringify(e));
@@ -130,17 +132,24 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
   };
 }
 
-async function updateVariantPrice(productId, variantId, price) {
+/* ====== actualizar precio + barcode + peso de la variante ====== */
+async function updateVariantDetails(productId, variantId, { price, barcode, weightKg }) {
   const q = `
     mutation UpdateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
       productVariantsBulkUpdate(productId: $productId, variants: $variants) {
         userErrors { field message }
       }
     }`;
-  const d = await gql(q, {
-    productId,
-    variants: [{ id: variantId, price: String(price) }],
-  });
+
+  const upd = { id: variantId };
+  if (price != null)   upd.price = String(price);
+  if (barcode)         upd.barcode = String(barcode);
+  if (weightKg && weightKg > 0) {
+    upd.weight = Number(weightKg);
+    upd.weightUnit = "KILOGRAMS";
+  }
+
+  const d = await gql(q, { productId, variants: [upd] });
   const e = d.productVariantsBulkUpdate.userErrors;
   if (e?.length) throw new Error(JSON.stringify(e));
 }
@@ -191,21 +200,41 @@ async function publishProduct(productId, publicationId) {
   if (e?.length) throw new Error(JSON.stringify(e));
 }
 
-// ====== MAPEO DESDE SYSCOM ======
+/* ================== MAPEO DESDE SYSCOM ================== */
 function mapSyscomProduct(P) {
+  // SKU y título
   const sku   = P.sku || P.codigo || P.clave || P.modelo;
   const title = P.nombre || P.titulo || P.descripcion_corta || P.descripcion;
   if (!sku || !title) return null;
 
+  // descripción / marca / categoría
   const desc   = P.descripcion_html || P.descripcion || "";
-  const vendor = (P.marca && (P.marca.nombre || P.marca)) || P.fabricante || "";
-  const ptype  = (P.categoria && (P.categoria.nombre || P.categoria)) || "";
-  const price  = P.precio ?? P.precio_publico ?? P.precio_lista ?? 0;
-  const qty    = P.existencia ?? P.stock ?? 0;
+  const vendor = (P.marca && (P.marca.nombre || P.marca)) || P.marca || P.fabricante || "";
+  const ptype  =
+    (Array.isArray(P.categorias) && (P.categorias[0]?.nombre || P.categorias[0])) ||
+    (P.categoria && (P.categoria.nombre || P.categoria)) ||
+    "";
 
+  // precio: considerar objeto "precios"
+  let price =
+    P.precio ??
+    P.precio_publico ??
+    P.precio_lista ??
+    (P.precios && (P.precios.publico ?? P.precios.precio ?? P.precios.lista)) ??
+    0;
+
+  // existencias totales
+  const qty =
+    P.existencia ??
+    P.stock ??
+    P.total_existencia ??
+    0;
+
+  // peso (si viene en gramos, lo normalizamos a kg)
   let weight_kg = P.peso_kg ?? P.peso ?? 0;
   if (weight_kg > 100) weight_kg = weight_kg / 1000;
 
+  // imágenes: imágenes[] / fotos[] / img_portada
   const images = [];
   if (Array.isArray(P.imagenes)) {
     for (const img of P.imagenes) {
@@ -217,9 +246,19 @@ function mapSyscomProduct(P) {
       if (typeof img === "string") { images.push(img); break; }
       if (img?.url)                 { images.push(img.url); break; }
     }
+  } else if (typeof P.img_portada === "string") {
+    images.push(P.img_portada);
   }
 
-  const barcode = P.barcode || P.ean || null;
+  // más alias de código de barras
+  const barcode =
+    P.codigo_barras ||
+    P.codigo_barras_ean ||
+    P.ean ||
+    P.barcode ||
+    P.gtin ||
+    P.upc ||
+    null;
 
   return {
     sku: String(sku),
@@ -227,14 +266,15 @@ function mapSyscomProduct(P) {
     descriptionHtml: String(desc),
     vendor: String(vendor),
     productType: String(ptype),
-    price,
-    available: Number(qty),
+    price: Number(price) || 0,
+    available: Number(qty) || 0,
     images,
     barcode,
+    weightKg: Number(weight_kg) || 0,
   };
 }
 
-// ====== MAIN ======
+/* ================== MAIN ================== */
 async function main() {
   if (!SHOP || !ADMIN_TOKEN || !SYSCOM_CLIENT_ID || !SYSCOM_CLIENT_SECRET) {
     throw new Error("Faltan variables de entorno obligatorias");
@@ -264,16 +304,8 @@ async function main() {
       });
     }
 
-    // Normalizamos posibles formas de respuesta
-    const productos =
-      list?.data?.productos || list?.data || list?.productos || list;
+    const productos = list?.data?.productos || list?.data || list?.productos || list;
 
-    // DEBUG de forma de respuesta y primer item
-    if (DEBUG) {
-      console.log("Shape respuesta top-level:", Object.keys(list || {}));
-    }
-
-    // DEBUG conteo + muestra (flexible)
     if (DEBUG) {
       console.log(
         `Página ${page}: ${Array.isArray(productos) ? productos.length : 0} productos`
@@ -281,9 +313,7 @@ async function main() {
       if (Array.isArray(productos) && productos.length) {
         const first = productos[0]?.producto || productos[0]?.Producto || productos[0]?.item || productos[0]?.Item || productos[0];
         console.log("Keys ejemplo (nivel 1):", first ? Object.keys(first) : "sin items");
-        try {
-          console.log("Ejemplo JSON (recortado):", JSON.stringify(first).slice(0, 800));
-        } catch {}
+        try { console.log("Ejemplo JSON (recortado):", JSON.stringify(first).slice(0, 800)); } catch {}
         console.log(
           "Muestra:",
           productos.slice(0, 3).map((pp) => {
@@ -298,28 +328,23 @@ async function main() {
 
     for (const p of productos) {
       try {
-        // Muchos listados vienen anidados
         const row = p.producto || p.Producto || p.item || p.Item || p;
 
-        // Intentamos obtener el ID de varias formas
+        // ID del producto
         let pid =
           row.id ||
           row.producto_id ||
           row.id_producto ||
           row.pid;
 
-        // A veces el ID viene en una URL tipo ".../productos/12345"
         if (!pid) {
           const u = row.url || row.link || row.href || "";
           const m = typeof u === "string" ? u.match(/productos\/(\d+)/) : null;
           if (m) pid = m[1];
         }
+        if (!pid) { if (DEBUG) console.log("Sin pid en item:", Object.keys(row || {})); continue; }
 
-        if (!pid) {
-          if (DEBUG) console.log("Sin pid en item, keys:", Object.keys(row || {}));
-          continue;
-        }
-
+        // Detalle
         const det = await sysget(token, `/productos/${pid}`, {});
         const sp  = det.data || det;
 
@@ -328,7 +353,11 @@ async function main() {
 
         const exists = await findVariantBySku(m.sku);
         if (exists) {
-          await updateVariantPrice(exists.product.id, exists.id, m.price);
+          await updateVariantDetails(exists.product.id, exists.id, {
+            price: m.price,
+            barcode: m.barcode,
+            weightKg: m.weightKg,
+          });
           await setInventorySku(exists.inventoryItem.id, m.sku);
           await adjustInventory(exists.inventoryItem.id, location, m.available);
           await publishProduct(exists.product.id, publicationId);
@@ -341,7 +370,11 @@ async function main() {
             productType: m.productType,
             images: m.images,
           });
-          await updateVariantPrice(res.productId, res.variantId, m.price);
+          await updateVariantDetails(res.productId, res.variantId, {
+            price: m.price,
+            barcode: m.barcode,
+            weightKg: m.weightKg,
+          });
           await setInventorySku(res.inventoryItemId, m.sku);
           await adjustInventory(res.inventoryItemId, location, m.available);
           await publishProduct(res.productId, publicationId);
@@ -363,7 +396,7 @@ async function main() {
   console.log(`Resumen => creados: ${created}, actualizados: ${updated}, errores: ${errors}`);
 }
 
-// Arranque
+/* ================== ARRANQUE ================== */
 main().catch((e) => {
   console.error(e?.response?.data || e?.message || e);
   process.exit(1);
