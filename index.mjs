@@ -16,6 +16,9 @@ const MODE = process.env.SYSCOM_MODE || "search";
 const QUERY = process.env.SYSCOM_QUERY || "camaras";
 const RUN_PAGES = parseInt(process.env.RUN_PAGES || "2", 10);
 const SLEEP_MS = parseInt(process.env.SLEEP_MS || "900", 10);
+const DEBUG = process.env.DEBUG === "1";
+const ONLY_STOCK = process.env.SYSCOM_ONLY_STOCK !== "0"; // por defecto TRUE
+
 
 const SYS_OAUTH = "https://developers.syscom.mx/oauth/token";
 const SYS_BASE  = "https://developers.syscom.mx/api/v1";
@@ -171,51 +174,82 @@ async function main(){
 
   let created=0, updated=0, errors=0;
 
-  for(let page=1; page<=RUN_PAGES; page++){
-    let list;
-    if(MODE==="brand"){
-      list = await sysget(token, `/marcas/${QUERY}/productos`, {stock:1, agrupar:1, pagina:page});
-    }else{
-      list = await sysget(token, `/productos`, {busqueda: QUERY, stock:1, agrupar:1, pagina:page});
-    }
-    const productos = list.data || list;
-    if(!Array.isArray(productos) || !productos.length) break;
+  for (let page = 1; page <= RUN_PAGES; page++) {
+  let list;
 
-    for(const p of productos){
-      try{
-        const pid = p.id || p.producto_id;
-        if(!pid) continue;
-        const det = await sysget(token, `/productos/${pid}`, {});
-        const sp = det.data || det;
-        const m = mapSyscomProduct(sp);
-        if(!m) continue;
+  if (MODE === "brand") {
+    // productos por marca (slug)
+    list = await sysget(token, `/marcas/${QUERY}/productos`, {
+      stock: (ONLY_STOCK ? 1 : 0),
+      agrupar: 1,
+      pagina: page
+    });
+  } else {
+    // búsqueda general
+    list = await sysget(token, `/productos`, {
+      busqueda: QUERY,
+      stock: (ONLY_STOCK ? 1 : 0),
+      agrupar: 1,
+      pagina: page
+    });
+  }
 
-        const exists = await findVariantBySku(m.sku);
-        if(exists){
-          await updateVariantPrice(exists.product.id, exists.id, m.price);
-          await setInventorySku(exists.inventoryItem.id, m.sku);
-          await adjustInventory(exists.inventoryItem.id, location, m.available);
-          await publishProduct(exists.product.id, publicationId);
-          updated++;
-        }else{
-          const res = await productCreate({
-            title: m.title, descriptionHtml: m.descriptionHtml, vendor: m.vendor,
-            productType: m.productType, images: m.images
-          });
-          await updateVariantPrice(res.productId, res.variantId, m.price);
-          await setInventorySku(res.inventoryItemId, m.sku);
-          await adjustInventory(res.inventoryItemId, location, m.available);
-          await publishProduct(res.productId, publicationId);
-          created++;
-        }
-      }catch(err){
-        errors++;
-        console.error("Error con producto", p.id || p.producto_id, err?.response?.data || err?.message || err);
-      }
-      await wait(SLEEP_MS);
+  // normalizamos diferentes formas que puede enviar SYSCOM
+  const productos = list?.data?.productos || list?.data || list?.productos || list;
+
+  // === DEBUG: cuántos llegaron y una muestra
+  if (DEBUG) {
+    console.log(`Página ${page}: ${Array.isArray(productos) ? productos.length : 0} productos`);
+    if (Array.isArray(productos)) {
+      console.log(
+        "Muestra:",
+        productos.slice(0, 3).map(p => p.sku || p.codigo || p.pid || p.id)
+      );
     }
   }
-  console.log(`Resumen => creados: ${created}, actualizados: ${updated}, errores: ${errors}`);
+
+  if (!Array.isArray(productos) || productos.length === 0) break;
+
+  for (const p of productos) {
+    try {
+      // aceptamos id/producto_id/pid (SYSCOM usa 'pid' en varios endpoints)
+      const pid = p.id || p.producto_id || p.pid;
+      if (!pid) continue;
+
+      const det = await sysget(token, `/productos/${pid}`, {});
+      const sp = det.data || det;
+
+      const m = mapSyscomProduct(sp);
+      if (!m) continue;
+
+      const exists = await findVariantBySku(m.sku);
+      if (exists) {
+        await updateVariantPrice(exists.product.id, exists.id, m.price);
+        await setInventorySku(exists.inventoryItem.id, m.sku);
+        await adjustInventory(exists.inventoryItem.id, location, m.available);
+        await publishProduct(exists.product.id, publicationId);
+        updated++;
+      } else {
+        const res = await productCreate({
+          title: m.title,
+          descriptionHtml: m.descriptionHtml,
+          vendor: m.vendor,
+          productType: m.productType,
+          images: m.images
+        });
+        await updateVariantPrice(res.productId, res.variantId, m.price);
+        await setInventorySku(res.inventoryItemId, m.sku);
+        await adjustInventory(res.inventoryItemId, location, m.available);
+        await publishProduct(res.productId, publicationId);
+        created++;
+      }
+    } catch (err) {
+      errors++;
+      console.error("Error con producto", p.id || p.producto_id || p.pid, err?.response?.data || err?.message || err);
+    }
+    await wait(SLEEP_MS);
+  }
 }
+
 
 main().catch(e => { console.error(e?.response?.data || e?.message || e); process.exit(1); });
