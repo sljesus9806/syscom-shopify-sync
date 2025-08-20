@@ -154,21 +154,13 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
   };
 }
 
-/* ====== actualizar SOLO PRECIO por GraphQL ====== */
-async function updateVariantPrice(productId, variantId, price) {
-  if (!(price > 0)) return; // evita poner precio 0
-  const q = `
-    mutation UpdateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
-      productVariantsBulkUpdate(productId: $productId, variants: $variants) {
-        userErrors { field message }
-      }
-    }`;
-  const d = await gql(q, {
-    productId,
-    variants: [{ id: variantId, price: String(price) }],
+/* ====== actualizar SOLO PRECIO por REST (seguro con Markets) ====== */
+async function updateVariantPrice(_productId, variantGid, price) {
+  if (!(price > 0)) return; // evita dejar $0.00
+  const variantIdNum = Number(String(variantGid).replace(/\D/g, ""));
+  await restPut(`variants/${variantIdNum}.json`, {
+    variant: { id: variantIdNum, price: String(Number(price).toFixed(2)) },
   });
-  const e = d.productVariantsBulkUpdate.userErrors;
-  if (e?.length) throw new Error(JSON.stringify(e));
 }
 
 /* ====== actualizar PESO por REST (en gramos) ====== */
