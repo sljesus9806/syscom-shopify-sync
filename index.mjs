@@ -15,28 +15,25 @@ const DEBUG      = process.env.DEBUG === "1";
 const ONLY_STOCK = process.env.SYSCOM_ONLY_STOCK !== "0"; // true = solo con stock
 
 // Preferencia de campos de precio desde Syscom.precios
-const PRICE_PREF = (process.env.SYSCOM_PRICE_PREF || "especial,oferta,descuento,precio,publico,lista")
-  .split(",")
-  .map(s => s.trim())
-  .filter(Boolean);
+const PRICE_PREF = (process.env.SYSCOM_PRICE_PREF || "descuento,especial,oferta,precio,publico,lista")
+  .split(",").map(s => s.trim()).filter(Boolean);
 
-// (Opcional) también colocar el precio final en la variante
-const SET_PRICE  = process.env.SET_PRICE === "1";
+// control de moneda/IVA/margen
+const SYSCOM_CURRENCY = (process.env.SYSCOM_CURRENCY || "mxn").toLowerCase(); // si el endpoint lo soporta
+const IVA_RATE   = Number(process.env.IVA_RATE || "1.16");  // 16% México
+const MARGIN_MIN = Number(process.env.MARGIN_MIN || "0.20");
+const MARGIN_MAX = Number(process.env.MARGIN_MAX || "0.25");
 
-// Parámetros de precio final
-const MARKUP_MIN = Number(process.env.MARKUP_MIN || "0.20");
-const MARKUP_MAX = Number(process.env.MARKUP_MAX || "0.25");
-const VAT_RATE   = Number(process.env.VAT_RATE   || "0.16");
-
-// Fallback de TC si la API falla
-const USD_FX_FALLBACK = Number(process.env.USD_FX_FALLBACK || "20");
+// ¿También escribir el precio de venta en la variante?
+const SET_PRICE  = process.env.SET_PRICE !== "0";
 
 /* ================== ENDPOINTS SYSCOM ================== */
 const SYS_OAUTH = "https://developers.syscom.mx/oauth/token";
 const SYS_BASE  = "https://developers.syscom.mx/api/v1";
 
 /* ================== UTILS ================== */
-const wait = (ms) => new Promise((r) => setTimeout(r, ms));
+const wait   = (ms) => new Promise((r) => setTimeout(r, ms));
+const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
 function firstNumber(...vals) {
   for (const v of vals) {
@@ -45,17 +42,7 @@ function firstNumber(...vals) {
   }
   return 0;
 }
-
-function round2(n) {
-  return Math.round((Number(n) || 0) * 100) / 100;
-}
-
-function pickDeterministicMargin(key = "") {
-  if (MARKUP_MIN === MARKUP_MAX) return MARKUP_MIN;
-  const seed = Array.from(String(key)).reduce((a, c) => a + (c.charCodeAt(0) % 10), 0);
-  const t = (seed % 101) / 100; // 0..1
-  return MARKUP_MIN + (MARKUP_MAX - MARKUP_MIN) * t;
-}
+const pickMargin = () => MARGIN_MIN + Math.random() * (MARGIN_MAX - MARGIN_MIN);
 
 /* ================== SYSCOM HELPERS ================== */
 async function syscomToken() {
@@ -78,21 +65,15 @@ async function sysget(token, path, params = {}) {
   return data;
 }
 
-/** Tipo de cambio oficial desde SYSCOM.
- *  GET /tipocambio → { normal, un_dia, una_semana, dos_semanas, tres_semanas, un_mes }
- */
-async function getSyscomUsdRate(token) {
+// tipo de cambio desde Syscom
+async function getExchangeRate(token) {
   try {
-    const d = await sysget(token, "/tipocambio", { moneda: "usd" });
-    const fx = firstNumber(
-      d?.normal, d?.un_dia, d?.una_semana, d?.dos_semanas, d?.tres_semanas, d?.un_mes
-    );
-    const v = fx > 0 ? fx : USD_FX_FALLBACK;
-    if (DEBUG) console.log("TC USD SYSCOM:", v);
-    return v;
-  } catch (e) {
-    if (DEBUG) console.log("TC USD SYSCOM falló, usando fallback:", USD_FX_FALLBACK, e?.message);
-    return USD_FX_FALLBACK;
+    const d = await sysget(token, "/tipocambio");
+    // responses suelen venir como { normal: "xx.xx" }
+    const tc = Number(d?.normal ?? d?.data?.normal ?? 1);
+    return tc > 0 ? tc : 1;
+  } catch {
+    return 1;
   }
 }
 
@@ -176,11 +157,10 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
         userErrors { field message }
       }
     }`;
-
   const media = (images || [])
     .filter(Boolean)
-    .slice(0, 10)
-    .map((u) => ({ originalSource: u }));
+    .map((u) => ({ originalSource: u }))
+    .slice(0, 10);
 
   const product = {
     title,
@@ -290,6 +270,7 @@ async function publishProduct(productId, publicationId) {
 /* ================== MAPEO DESDE SYSCOM ================== */
 function pickPriceFromPrecios(precios) {
   if (!precios || typeof precios !== "object") return 0;
+
   for (const k of PRICE_PREF) {
     if (k in precios) {
       const val = firstNumber(precios[k]);
@@ -302,19 +283,31 @@ function pickPriceFromPrecios(precios) {
   return candidates.length ? Math.min(...candidates) : 0;
 }
 
-function detectCurrency(P, precios) {
-  const m = String(P.moneda || P.currency || P.divisa || "").toUpperCase();
-  if (m.includes("USD") || m.includes("DOL")) return "USD";
-  const keys = Object.keys(precios || {}).map(k => k.toLowerCase());
-  if (keys.some(k => k.includes("usd") || k.includes("dolar"))) return "USD";
-  return "MXN";
+function normalizeImages(P) {
+  const images = [];
+  if (Array.isArray(P.imagenes)) {
+    for (const img of P.imagenes) {
+      if (typeof img === "string") { images.push(img); break; }
+      if (img?.url)               { images.push(img.url); break; }
+    }
+  } else if (Array.isArray(P.fotos)) {
+    for (const img of P.fotos) {
+      if (typeof img === "string") { images.push(img); break; }
+      if (img?.url)               { images.push(img.url); break; }
+    }
+  } else if (typeof P.img_portada === "string") {
+    images.push(P.img_portada);
+  }
+  return images;
 }
 
-function mapSyscomProduct(P) {
+function mapSyscomProduct(P, tc) {
+  // sku/título
   const sku   = P.sku || P.codigo || P.clave || P.modelo;
   const title = P.nombre || P.titulo || P.descripcion_corta || P.descripcion;
   if (!sku || !title) return null;
 
+  // desc/marca/categoría
   const desc   = P.descripcion_html || P.descripcion || "";
   const vendor = (P.marca && (P.marca.nombre || P.marca)) || P.marca || P.fabricante || "";
   const ptype  =
@@ -322,44 +315,35 @@ function mapSyscomProduct(P) {
     (P.categoria && (P.categoria.nombre || P.categoria)) ||
     "";
 
-  // Precio (preferimos "descuento"/"especial"... sin IVA)
+  // precio base: costo proveedor = precio_con_descuento (o el más bajo disponible)
   const precios = P.precios || {};
-  const base    = pickPriceFromPrecios(precios) ||
-                  firstNumber(P.precio, P.precio_publico, P.precio_lista);
+  let base = pickPriceFromPrecios(precios) ||
+             firstNumber(P.precio, P.precio_publico, P.precio_lista);
 
-  const currency = detectCurrency(P, precios);
+  // moneda de origen reportada por Syscom (si viene). Si no, asumimos la que pedimos.
+  const monedaOrigen =
+    (P.moneda || P.precios?.moneda || SYSCOM_CURRENCY).toString().toLowerCase();
 
-  // existencias totales
+  // convertir costo a MXN si viene en USD
+  let costMXN = base;
+  if (monedaOrigen === "usd") costMXN = base * (tc || 1);
+
+  // existencia/peso/imagenes/barcode
   const qty = firstNumber(P.existencia, P.stock, P.total_existencia);
-
-  // peso (si viene en gramos, lo normalizamos a kg)
   let weightKg = firstNumber(P.peso_kg, P.peso);
   if (weightKg > 100) weightKg = weightKg / 1000;
 
-  // imágenes: imágenes[] / fotos[] / img_portada  (hasta 10)
-  const images = [];
-  const pushImg = (u) => { if (u && images.length < 10) images.push(String(u)); };
-  if (Array.isArray(P.imagenes)) {
-    for (const img of P.imagenes) {
-      if (typeof img === "string") pushImg(img);
-      else if (img?.url)           pushImg(img.url);
-      if (images.length >= 10) break;
-    }
-  } else if (Array.isArray(P.fotos)) {
-    for (const img of P.fotos) {
-      if (typeof img === "string") pushImg(img);
-      else if (img?.url)           pushImg(img.url);
-      if (images.length >= 10) break;
-    }
-  } else if (typeof P.img_portada === "string") {
-    pushImg(P.img_portada);
-  }
+  const images = normalizeImages(P);
 
   const barcode =
     P.codigo_barras || P.codigo_barras_ean || P.ean || P.barcode || P.gtin || P.upc || null;
 
-  if (DEBUG && precios && Object.keys(precios).length) {
-    try { console.log("Precios Syscom:", JSON.stringify(precios)); } catch {}
+  // precio final = costo_mxn × IVA × (1 + margen[20..25] %)
+  const margin = pickMargin();
+  const price  = round2(costMXN * IVA_RATE * (1 + margin));
+
+  if (DEBUG) {
+    console.log(`SKU ${sku} | base:${base} ${monedaOrigen.toUpperCase()} | tc:${tc} | costMXN:${round2(costMXN)} | price:${price}`);
   }
 
   return {
@@ -368,8 +352,8 @@ function mapSyscomProduct(P) {
     descriptionHtml: String(desc),
     vendor: String(vendor),
     productType: String(ptype),
-    base,                 // precio base (descuento) SIN IVA, en MXN o USD según currency
-    currency,             // "MXN" | "USD"
+    cost: round2(costMXN),
+    price,                             // precio final calculado
     available: Number(qty) || 0,
     images,
     barcode,
@@ -386,9 +370,7 @@ async function main() {
   const publicationId = await getPublicationId();
   const location      = await getLocation();
   const token         = await syscomToken();
-
-  // Tipo de cambio USD oficial SYSCOM (una vez por corrida)
-  const usdRate = await getSyscomUsdRate(token);
+  const tc            = await getExchangeRate(token); // USD→MXN de Syscom
 
   let created = 0, updated = 0, errors = 0;
 
@@ -400,6 +382,7 @@ async function main() {
         stock: (ONLY_STOCK ? 1 : 0),
         agrupar: 1,
         pagina: page,
+        moneda: SYSCOM_CURRENCY, // si el endpoint lo soporta, forzamos MXN
       });
     } else {
       list = await sysget(token, `/productos`, {
@@ -407,6 +390,7 @@ async function main() {
         stock: (ONLY_STOCK ? 1 : 0),
         agrupar: 1,
         pagina: page,
+        moneda: SYSCOM_CURRENCY, // si el endpoint lo soporta, forzamos MXN
       });
     }
 
@@ -420,13 +404,6 @@ async function main() {
         const first = productos[0]?.producto || productos[0]?.Producto || productos[0]?.item || productos[0]?.Item || productos[0];
         console.log("Keys ejemplo (nivel 1):", first ? Object.keys(first) : "sin items");
         try { console.log("Ejemplo JSON (recortado):", JSON.stringify(first).slice(0, 800)); } catch {}
-        console.log(
-          "Muestra:",
-          productos.slice(0, 3).map((pp) => {
-            const r = pp.producto || pp.Producto || pp.item || pp.Item || pp;
-            return r.sku || r.codigo || r.clave || r.modelo || r.pid || r.id || r.id_producto;
-          })
-        );
       }
     }
 
@@ -444,25 +421,18 @@ async function main() {
         }
         if (!pid) { if (DEBUG) console.log("Sin pid en item:", Object.keys(row || {})); continue; }
 
-        const det = await sysget(token, `/productos/${pid}`, {});
+        const det = await sysget(token, `/productos/${pid}`, { moneda: SYSCOM_CURRENCY });
         const sp  = det.data || det;
 
-        const m = mapSyscomProduct(sp);
-        if (!m) continue;
-
-        // ==== COSTO (sin IVA) en MXN ====
-        const costMXN = m.currency === "USD" ? (Number(m.base) * usdRate) : Number(m.base);
-
-        // ==== PRECIO DE VENTA (con margen 20–25% y luego IVA) ====
-        const margin = pickDeterministicMargin(m.sku);
-        const priceFinal = round2( round2(costMXN * (1 + margin)) * (1 + VAT_RATE) );
+        const m = mapSyscomProduct(sp, tc);
+        if (!m || !(m.cost > 0)) continue;
 
         const exists = await findVariantBySku(m.sku);
         if (exists) {
-          if (SET_PRICE) await updateVariantPrice(exists.product.id, exists.id, priceFinal);
+          if (SET_PRICE) await updateVariantPrice(exists.product.id, exists.id, m.price);
           await updateVariantWeight(exists.id, m.weightKg);
           await setInventorySku(exists.inventoryItem.id, m.sku, m.barcode);
-          await updateInventoryCost(exists.inventoryItem.id, round2(costMXN));
+          await updateInventoryCost(exists.inventoryItem.id, m.cost);
           await adjustInventory(exists.inventoryItem.id, location, m.available);
           await publishProduct(exists.product.id, publicationId);
           updated++;
@@ -474,10 +444,10 @@ async function main() {
             productType: m.productType,
             images: m.images,
           });
-          if (SET_PRICE) await updateVariantPrice(res.productId, res.variantId, priceFinal);
+          if (SET_PRICE) await updateVariantPrice(res.productId, res.variantId, m.price);
           await updateVariantWeight(res.variantId, m.weightKg);
           await setInventorySku(res.inventoryItemId, m.sku, m.barcode);
-          await updateInventoryCost(res.inventoryItemId, round2(costMXN));
+          await updateInventoryCost(res.inventoryItemId, m.cost);
           await adjustInventory(res.inventoryItemId, location, m.available);
           await publishProduct(res.productId, publicationId);
           created++;
