@@ -165,19 +165,15 @@ async function findVariantBySku(sku) {
   return e.length ? e[0].node : null;
 }
 
-/* ====== crear producto con media opcional (varias imágenes) ====== */
+/* ====== crear producto (con media) con fallback ====== */
 async function productCreate({ title, descriptionHtml, vendor, productType, images }) {
-  const q = `
+  const createMutation = `
     mutation CreateProduct($product: ProductCreateInput!, $media: [CreateMediaInput!]) {
       productCreate(product: $product, media: $media) {
         product { id variants(first: 1) { nodes { id inventoryItem { id } } } }
         userErrors { field message }
       }
     }`;
-  const media = (images || [])
-    .filter(Boolean)
-    .map((u) => ({ originalSource: u }))
-    .slice(0, Math.min(MAX_IMAGES, 10));
 
   const product = {
     title,
@@ -187,15 +183,37 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
     status: "ACTIVE",
   };
 
-  const d = await gql(q, { product, media });
-  const e = d.productCreate.userErrors;
-  if (e?.length) throw new Error(JSON.stringify(e));
-  const p = d.productCreate.product;
-  return {
-    productId: p.id,
-    variantId: p.variants.nodes[0].id,
-    inventoryItemId: p.variants.nodes[0].inventoryItem.id,
-  };
+  // Intento 1: con media (incluye mediaContentType)
+  const media = (images || [])
+    .filter(Boolean)
+    .map((u) => ({ originalSource: u, mediaContentType: "IMAGE" }))
+    .slice(0, Math.min(MAX_IMAGES, 10));
+
+  try {
+    const d = await gql(createMutation, { product, media });
+    const e = d.productCreate.userErrors;
+    if (e?.length) throw new Error(JSON.stringify(e));
+    const p = d.productCreate.product;
+    return {
+      productId: p.id,
+      variantId: p.variants.nodes[0].id,
+      inventoryItemId: p.variants.nodes[0].inventoryItem.id,
+      createdWithMedia: true,
+    };
+  } catch (err) {
+    if (DEBUG) console.error("productCreate (con media) falló, intentando sin media:", err?.message || err);
+    // Intento 2: sin media
+    const d2 = await gql(createMutation, { product, media: [] });
+    const e2 = d2.productCreate.userErrors;
+    if (e2?.length) throw new Error(JSON.stringify(e2));
+    const p2 = d2.productCreate.product;
+    return {
+      productId: p2.id,
+      variantId: p2.variants.nodes[0].id,
+      inventoryItemId: p2.variants.nodes[0].inventoryItem.id,
+      createdWithMedia: false,
+    };
+  }
 }
 
 /* ====== actualizar SOLO PRECIO por GraphQL ====== */
@@ -512,7 +530,7 @@ async function main() {
             descriptionHtml: m.descriptionHtml,
             vendor: m.vendor,
             productType: m.productType,
-            images: m.images, // ya respeta MAX_IMAGES internamente
+            images: m.images, // intenta con media; si falla, fallback sin media
           });
           if (SET_PRICE) await updateVariantPrice(res.productId, res.variantId, m.price);
           await updateVariantWeight(res.variantId, m.weightKg);
@@ -521,6 +539,10 @@ async function main() {
           await adjustInventory(res.inventoryItemId, location, m.available);
           await publishProduct(res.productId, publicationId);
 
+          // Si se creó sin media, anexa por REST
+          if (!res.createdWithMedia && m.images?.length) {
+            await addImagesToProduct(res.productId, m.images.slice(0, MAX_IMAGES));
+          }
           // (Opcional) asegurar anexado de faltantes si enviaste >10 en MAX_IMAGES
           if (m.images?.length > 10) {
             await addImagesToProduct(res.productId, m.images.slice(10, MAX_IMAGES));
