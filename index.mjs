@@ -14,23 +14,22 @@ const SLEEP_MS  = parseInt(process.env.SLEEP_MS  || "900", 10);
 const DEBUG      = process.env.DEBUG === "1";
 const ONLY_STOCK = process.env.SYSCOM_ONLY_STOCK !== "0"; // true = solo con stock
 
-// Preferencia de campos de precio desde Syscom.precios
-const PRICE_PREF = (process.env.SYSCOM_PRICE_PREF || "descuento,especial,oferta,precio,publico,lista")
+// Preferencia de campos de precio desde Syscom.precios (orden de preferencia)
+const PRICE_PREF = (process.env.SYSCOM_PRICE_PREF || "descuento,especial,oferta,precio,publico,lista,precio_con_descuento,precio_publico,precio_lista")
   .split(",").map(s => s.trim()).filter(Boolean);
 
-// control de moneda/IVA/margen
-const SYSCOM_CURRENCY = (process.env.SYSCOM_CURRENCY || "mxn").toLowerCase(); // si el endpoint lo soporta
-const IVA_RATE   = Number(process.env.IVA_RATE || "1.16");  // 16% México
+// Moneda/IVA/margen
+const SYSCOM_CURRENCY = (process.env.SYSCOM_CURRENCY || "mxn").toLowerCase();
+const IVA_RATE   = Number(process.env.IVA_RATE || "1.16");
 const MARGIN_MIN = Number(process.env.MARGIN_MIN || "0.20");
 const MARGIN_MAX = Number(process.env.MARGIN_MAX || "0.25");
 
-// ¿También escribir el precio de venta en la variante?
 const SET_PRICE  = process.env.SET_PRICE !== "0";
 
 // Imágenes
 const MAX_IMAGES = parseInt(process.env.SYSCOM_MAX_IMAGES || "8", 10);
 
-// Precios: umbral mínimo para descartar porcentajes/ruido en fallback
+// Filtro de precios (descarta candidatos absurdamente bajos)
 const PRICE_MIN  = Number(process.env.SYSCOM_PRICE_MIN || "50");
 
 /* ================== ENDPOINTS SYSCOM ================== */
@@ -41,12 +40,45 @@ const SYS_BASE  = "https://developers.syscom.mx/api/v1";
 const wait   = (ms) => new Promise((r) => setTimeout(r, ms));
 const round2 = (n) => Math.round((Number(n) + Number.EPSILON) * 100) / 100;
 
+// Parseador robusto de dinero: quita símbolos, soporta coma decimal, miles con , o .
+function money(val) {
+  if (val == null) return NaN;
+  if (typeof val === "number") return val;
+  if (typeof val !== "string") return NaN;
+  let s = val.trim();
+  if (!s) return NaN;
+  // quita símbolos y texto de moneda
+  s = s.replace(/\s*(MXN|USD|\$|us[d]?|mxn|eur|€|dlls?|\bpesos?\b)\s*/ig, "");
+  // si tiene coma y punto, decide formato (1.234,56 o 1,234.56)
+  const hasComma = s.includes(",");
+  const hasDot   = s.includes(".");
+  if (hasComma && hasDot) {
+    // si el último separador es coma → coma decimal (EU)
+    if (s.lastIndexOf(",") > s.lastIndexOf(".")) {
+      s = s.replace(/\./g, "").replace(",", ".");
+    } else {
+      // último es punto → punto decimal, quita comas miles
+      s = s.replace(/,/g, "");
+    }
+  } else if (hasComma && !hasDot) {
+    // solo coma → probablemente decimal
+    s = s.replace(/\./g, "").replace(",", ".");
+  } else {
+    // solo punto → quita comas de miles
+    s = s.replace(/,/g, "");
+  }
+  // quita cualquier cosa que no sea dígito, punto o signo
+  s = s.replace(/[^0-9.+-]/g, "");
+  const n = Number(s);
+  return isFinite(n) ? n : NaN;
+}
+
 function firstNumber(...vals) {
   for (const v of vals) {
-    if (typeof v === "number" && isFinite(v)) return v;
-    if (typeof v === "string" && v.trim() !== "" && !isNaN(Number(v))) return Number(v);
+    const n = money(v);
+    if (isFinite(n)) return n;
   }
-  return 0;
+  return NaN;
 }
 const pickMargin = () => MARGIN_MIN + Math.random() * (MARGIN_MAX - MARGIN_MIN);
 
@@ -120,11 +152,10 @@ async function restPost(path, payload) {
 }
 
 async function getPublicationId() {
-  const q = `
-    query { publications(first: 10) { edges { node { id catalog { title } } } } }`;
+  const q = `query { publications(first: 10) { edges { node { id catalog { title } } } } }`;
   const d = await gql(q);
   if (!d.publications.edges.length) throw new Error("No hay publications");
-  return d.publications.edges[0].node.id; // Online Store usualmente
+  return d.publications.edges[0].node.id;
 }
 
 async function getLocation() {
@@ -158,7 +189,6 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
 
   const product = { title, descriptionHtml: descriptionHtml || "", vendor: vendor || "", productType: productType || "", status: "ACTIVE" };
 
-  // Intento 1: con media (incluye mediaContentType)
   const media = (images || [])
     .filter(Boolean)
     .map((u) => ({ originalSource: u, mediaContentType: "IMAGE" }))
@@ -180,7 +210,7 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
   }
 }
 
-/* ====== precio, peso, inventario ====== */
+/* ====== PRECIO / PESO / INVENTARIO ====== */
 async function updateVariantPrice(productId, variantId, price) {
   if (!(price > 0)) return;
   const q = `
@@ -255,15 +285,7 @@ async function publishProduct(productId, publicationId) {
 }
 
 /* ================== IMÁGENES ================== */
-// HEAD rápido para validar si existe
-async function headOk(url) {
-  try {
-    await axios.head(url, { timeout: 6000, maxRedirects: 3, validateStatus: s => s >= 200 && s < 400 });
-    return true;
-  } catch { return false; }
-}
-
-// recoge varias, conserva originales y añade variante "limpia"
+// Toma varias del JSON, conserva originales y añade versión "limpia"
 function collectBasicImages(P) {
   const originals = [];
   const hires = [];
@@ -300,7 +322,7 @@ function collectBasicImages(P) {
   return uniq([...originals, ...hires]).slice(0, MAX_IMAGES);
 }
 
-// genera “hermanas” …-0.jpg → …-1.jpg,…-8.jpg
+// Genera hermanas ...-0.jpg → ...-1.jpg..-8.jpg (sin validar con HEAD)
 function guessSiblings(u) {
   const out = [];
   const m = u.match(/(.*?)([-_])0(\.[a-z]+)$/i);
@@ -310,11 +332,9 @@ function guessSiblings(u) {
   return out;
 }
 
-// pipeline completo: colecta, adivina hermanas y valida HEAD
-async function buildImageList(P) {
+function buildImageListNoHead(P) {
   const base = collectBasicImages(P);
   const want = new Set(base);
-
   if (base.length < MAX_IMAGES) {
     for (const u of base) {
       for (const sib of guessSiblings(u)) {
@@ -324,35 +344,30 @@ async function buildImageList(P) {
       if (want.size >= MAX_IMAGES) break;
     }
   }
-
-  // valida que existan
-  const list = Array.from(want).slice(0, MAX_IMAGES);
-  const results = await Promise.all(list.map(async (u) => (await headOk(u)) ? u : null));
-  const valid = results.filter(Boolean);
-  return valid.length ? valid : base.slice(0, MAX_IMAGES);
+  return Array.from(want).slice(0, MAX_IMAGES);
 }
 
 /* ================== MAPEO DESDE SYSCOM ================== */
 function pickPriceFromPrecios(precios) {
-  if (!precios || typeof precios !== "object") return 0;
+  if (!precios || typeof precios !== "object") return NaN;
 
-  // 1) preferencia explícita
+  // Preferencia explícita
   for (const k of PRICE_PREF) {
     if (k in precios) {
-      const val = firstNumber(precios[k]);
-      if (val >= PRICE_MIN) return val;
+      const v = money(precios[k]);
+      if (isFinite(v) && v >= PRICE_MIN) return v;
     }
   }
 
-  // 2) fallback: valores numéricos plausibles (>= PRICE_MIN)
-  const nums = Object.values(precios).map(firstNumber).filter(n => isFinite(n) && n >= PRICE_MIN);
+  // Fallback: cualquier numérico >= PRICE_MIN
+  const nums = Object.values(precios).map(money).filter(n => isFinite(n) && n >= PRICE_MIN);
   if (nums.length) return Math.min(...nums);
 
-  // 3) fallback extremo: evita porcentajes [0..1]; toma el mayor valor restante
-  const notPerc = Object.values(precios).map(firstNumber).filter(n => isFinite(n) && n > 1);
+  // Último recurso: evita porcentajes (0..1) y toma el menor >1
+  const notPerc = Object.values(precios).map(money).filter(n => isFinite(n) && n > 1);
   if (notPerc.length) return Math.min(...notPerc);
 
-  return 0;
+  return NaN;
 }
 
 function mapSyscomProduct(P, tc, images) {
@@ -368,16 +383,18 @@ function mapSyscomProduct(P, tc, images) {
     "";
 
   const precios = P.precios || {};
-  let base = pickPriceFromPrecios(precios) || firstNumber(P.precio, P.precio_publico, P.precio_lista);
+  let base = pickPriceFromPrecios(precios);
+  if (!isFinite(base)) base = firstNumber(P.precio, P.precio_publico, P.precio_lista);
 
-  const monedaOrigen = (P.moneda || P.precios?.moneda || SYSCOM_CURRENCY).toString().toLowerCase();
+  const monedaOrigen =
+    (P.moneda || P.precios?.moneda || SYSCOM_CURRENCY).toString().toLowerCase();
 
   let costMXN = base;
   if (monedaOrigen === "usd") costMXN = base * (tc || 1);
 
   const qty = firstNumber(P.existencia, P.stock, P.total_existencia);
   let weightKg = firstNumber(P.peso_kg, P.peso);
-  if (weightKg > 100) weightKg = weightKg / 1000;
+  if (isFinite(weightKg) && weightKg > 100) weightKg = weightKg / 1000;
 
   const barcode = P.codigo_barras || P.codigo_barras_ean || P.ean || P.barcode || P.gtin || P.upc || null;
 
@@ -385,6 +402,8 @@ function mapSyscomProduct(P, tc, images) {
   const price  = round2(costMXN * IVA_RATE * (1 + margin));
 
   if (DEBUG) {
+    console.log("— PRECIOS RAW KEYS:", Object.keys(precios || {}));
+    try { console.log("— PRECIOS RAW JSON:", JSON.stringify(precios).slice(0, 300)); } catch {}
     console.log(`SKU ${sku} | base:${base} ${monedaOrigen.toUpperCase()} | tc:${tc} | costMXN:${round2(costMXN)} | price:${price} | imgs:${images?.length || 0}`);
   }
 
@@ -399,7 +418,7 @@ function mapSyscomProduct(P, tc, images) {
     available: Number(qty) || 0,
     images: images || [],
     barcode,
-    weightKg: Number(weightKg) || 0,
+    weightKg: isFinite(weightKg) ? Number(weightKg) : 0,
   };
 }
 
@@ -420,115 +439,4 @@ async function main() {
     let list;
 
     if (MODE === "brand") {
-      list = await sysget(token, `/marcas/${QUERY}/productos`, {
-        stock: (ONLY_STOCK ? 1 : 0),
-        agrupar: 1,
-        pagina: page,
-        moneda: SYSCOM_CURRENCY,
-      });
-    } else {
-      list = await sysget(token, `/productos`, {
-        busqueda: QUERY,
-        stock: (ONLY_STOCK ? 1 : 0),
-        agrupar: 1,
-        pagina: page,
-        moneda: SYSCOM_CURRENCY,
-      });
-    }
-
-    const productos = list?.data?.productos || list?.data || list?.productos || list;
-
-    if (DEBUG) {
-      console.log(`Página ${page}: ${Array.isArray(productos) ? productos.length : 0} productos`);
-      if (Array.isArray(productos) && productos.length) {
-        const first = productos[0]?.producto || productos[0]?.Producto || productos[0]?.item || productos[0]?.Item || productos[0];
-        console.log("Keys ejemplo (nivel 1):", first ? Object.keys(first) : "sin items");
-        try { console.log("Ejemplo JSON (recortado):", JSON.stringify(first).slice(0, 800)); } catch {}
-      }
-    }
-
-    if (!Array.isArray(productos) || productos.length === 0) break;
-
-    for (const p of productos) {
-      try {
-        const row = p.producto || p.Producto || p.item || p.Item || p;
-
-        let pid = row.id || row.producto_id || row.id_producto || row.pid;
-        if (!pid) {
-          const u = row.url || row.link || row.href || "";
-          const m = typeof u === "string" ? u.match(/productos\/(\d+)/) : null;
-          if (m) pid = m[1];
-        }
-        if (!pid) { if (DEBUG) console.log("Sin pid en item:", Object.keys(row || {})); continue; }
-
-        const det = await sysget(token, `/productos/${pid}`, { moneda: SYSCOM_CURRENCY });
-        const sp  = det.data || det;
-
-        if (DEBUG) {
-          const imgKeys = Object.keys(sp || {}).filter(k => /img|imagen|imagenes|fotos|galeria/i.test(k));
-          console.log(`PID ${pid} → claves de imagen:`, imgKeys);
-        }
-
-        // Construye lista de imágenes (básicas + “hermanas” validadas)
-        const images = await buildImageList(sp);
-        if (DEBUG) console.log(`PID ${pid} → imágenes encontradas/validadas (${images.length}):`, images.slice(0, 12));
-
-        const m = mapSyscomProduct(sp, tc, images);
-        if (!m || !(m.cost > 0)) continue;
-
-        const exists = await findVariantBySku(m.sku);
-        if (exists) {
-          if (SET_PRICE) await updateVariantPrice(exists.product.id, exists.id, m.price);
-          await updateVariantWeight(exists.id, m.weightKg);
-          await setInventorySku(exists.inventoryItem.id, m.sku, m.barcode);
-          await updateInventoryCost(exists.inventoryItem.id, m.cost);
-          await adjustInventory(exists.inventoryItem.id, location, m.available);
-          await publishProduct(exists.product.id, publicationId);
-
-          if (m.images?.length) {
-            const imgCount = await getProductImageCountByGid(exists.product.id);
-            if (imgCount < Math.min(MAX_IMAGES, m.images.length)) {
-              await addImagesToProduct(exists.product.id, m.images.slice(imgCount, MAX_IMAGES));
-            }
-          }
-          updated++;
-        } else {
-          const res = await productCreate({
-            title: m.title,
-            descriptionHtml: m.descriptionHtml,
-            vendor: m.vendor,
-            productType: m.productType,
-            images: m.images,
-          });
-          if (SET_PRICE) await updateVariantPrice(res.productId, res.variantId, m.price);
-          await updateVariantWeight(res.variantId, m.weightKg);
-          await setInventorySku(res.inventoryItemId, m.sku, m.barcode);
-          await updateInventoryCost(res.inventoryItemId, m.cost);
-          await adjustInventory(res.inventoryItemId, location, m.available);
-          await publishProduct(res.productId, publicationId);
-
-          if (!res.createdWithMedia && m.images?.length) {
-            await addImagesToProduct(res.productId, m.images.slice(0, MAX_IMAGES));
-          }
-          if (m.images?.length > 10) {
-            await addImagesToProduct(res.productId, m.images.slice(10, MAX_IMAGES));
-          }
-          created++;
-        }
-      } catch (err) {
-        errors++;
-        console.error("Error con producto", p.id || p.producto_id || p.pid, err?.response?.data || err?.message || err);
-      }
-
-      await wait(SLEEP_MS);
-    }
-  }
-
-  console.log(`Resumen => creados: ${created}, actualizados: ${updated}, errores: ${errors}`);
-}
-
-/* ================== ARRANQUE ================== */
-main().catch((e) => {
-  console.error(e?.response?.data || e?.message || e);
-  process.exit(1);
-});
+      list = await sysget(token,
