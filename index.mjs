@@ -30,6 +30,9 @@ const SET_PRICE  = process.env.SET_PRICE !== "0";
 // Imágenes
 const MAX_IMAGES = parseInt(process.env.SYSCOM_MAX_IMAGES || "8", 10);
 
+// Precios: umbral mínimo para descartar porcentajes/ruido en fallback
+const PRICE_MIN  = Number(process.env.SYSCOM_PRICE_MIN || "50");
+
 /* ================== ENDPOINTS SYSCOM ================== */
 const SYS_OAUTH = "https://developers.syscom.mx/oauth/token";
 const SYS_BASE  = "https://developers.syscom.mx/api/v1";
@@ -84,12 +87,7 @@ async function gql(query, variables = {}) {
   const { data } = await axios.post(
     `https://${SHOP}.myshopify.com/admin/api/2025-07/graphql.json`,
     { query, variables },
-    {
-      headers: {
-        "X-Shopify-Access-Token": ADMIN_TOKEN,
-        "Content-Type": "application/json",
-      },
-    }
+    { headers: { "X-Shopify-Access-Token": ADMIN_TOKEN, "Content-Type": "application/json" } }
   );
   if (data.errors) throw new Error(JSON.stringify(data.errors));
   return data.data;
@@ -107,12 +105,7 @@ async function restPut(path, payload) {
   const { data } = await axios.put(
     `https://${SHOP}.myshopify.com/admin/api/2025-07/${path}`,
     payload,
-    {
-      headers: {
-        "X-Shopify-Access-Token": ADMIN_TOKEN,
-        "Content-Type": "application/json",
-      },
-    }
+    { headers: { "X-Shopify-Access-Token": ADMIN_TOKEN, "Content-Type": "application/json" } }
   );
   return data;
 }
@@ -121,26 +114,17 @@ async function restPost(path, payload) {
   const { data } = await axios.post(
     `https://${SHOP}.myshopify.com/admin/api/2025-07/${path}`,
     payload,
-    {
-      headers: {
-        "X-Shopify-Access-Token": ADMIN_TOKEN,
-        "Content-Type": "application/json",
-      },
-    }
+    { headers: { "X-Shopify-Access-Token": ADMIN_TOKEN, "Content-Type": "application/json" } }
   );
   return data;
 }
 
 async function getPublicationId() {
   const q = `
-    query {
-      publications(first: 10) {
-        edges { node { id catalog { title } } }
-      }
-    }`;
+    query { publications(first: 10) { edges { node { id catalog { title } } } } }`;
   const d = await gql(q);
   if (!d.publications.edges.length) throw new Error("No hay publications");
-  return d.publications.edges[0].node.id; // usualmente Online Store
+  return d.publications.edges[0].node.id; // Online Store usualmente
 }
 
 async function getLocation() {
@@ -154,9 +138,7 @@ async function findVariantBySku(sku) {
   const q = `
     query ($q: String!) {
       productVariants(first: 1, query: $q) {
-        edges {
-          node { id sku product { id status } inventoryItem { id } }
-        }
+        edges { node { id sku product { id status } inventoryItem { id } } }
       }
     }`;
   const d = await gql(q, { q: `sku:${sku}` });
@@ -174,13 +156,7 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
       }
     }`;
 
-  const product = {
-    title,
-    descriptionHtml: descriptionHtml || "",
-    vendor: vendor || "",
-    productType: productType || "",
-    status: "ACTIVE",
-  };
+  const product = { title, descriptionHtml: descriptionHtml || "", vendor: vendor || "", productType: productType || "", status: "ACTIVE" };
 
   // Intento 1: con media (incluye mediaContentType)
   const media = (images || [])
@@ -193,46 +169,31 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
     const e = d.productCreate.userErrors;
     if (e?.length) throw new Error(JSON.stringify(e));
     const p = d.productCreate.product;
-    return {
-      productId: p.id,
-      variantId: p.variants.nodes[0].id,
-      inventoryItemId: p.variants.nodes[0].inventoryItem.id,
-      createdWithMedia: true,
-    };
+    return { productId: p.id, variantId: p.variants.nodes[0].id, inventoryItemId: p.variants.nodes[0].inventoryItem.id, createdWithMedia: true };
   } catch (err) {
     if (DEBUG) console.error("productCreate (con media) falló, intentando sin media:", err?.message || err);
-    // Intento 2: sin media
     const d2 = await gql(createMutation, { product, media: [] });
     const e2 = d2.productCreate.userErrors;
     if (e2?.length) throw new Error(JSON.stringify(e2));
     const p2 = d2.productCreate.product;
-    return {
-      productId: p2.id,
-      variantId: p2.variants.nodes[0].id,
-      inventoryItemId: p2.variants.nodes[0].inventoryItem.id,
-      createdWithMedia: false,
-    };
+    return { productId: p2.id, variantId: p2.variants.nodes[0].id, inventoryItemId: p2.variants.nodes[0].inventoryItem.id, createdWithMedia: false };
   }
 }
 
-/* ====== actualizar SOLO PRECIO por GraphQL ====== */
+/* ====== precio, peso, inventario ====== */
 async function updateVariantPrice(productId, variantId, price) {
-  if (!(price > 0)) return; // evita poner precio 0
+  if (!(price > 0)) return;
   const q = `
     mutation UpdateVariants($productId: ID!, $variants: [ProductVariantsBulkInput!]!) {
       productVariantsBulkUpdate(productId: $productId, variants: $variants) {
         userErrors { field message }
       }
     }`;
-  const d = await gql(q, {
-    productId,
-    variants: [{ id: variantId, price: String(round2(price)) }],
-  });
+  const d = await gql(q, { productId, variants: [{ id: variantId, price: String(round2(price)) }] });
   const e = d.productVariantsBulkUpdate.userErrors;
   if (e?.length) throw new Error(JSON.stringify(e));
 }
 
-/* ====== actualizar PESO por REST (en gramos) ====== */
 async function updateVariantWeight(variantGid, weightKg) {
   if (!(weightKg > 0)) return;
   const variantIdNum = Number(String(variantGid).replace(/\D/g, ""));
@@ -240,7 +201,6 @@ async function updateVariantWeight(variantGid, weightKg) {
   await restPut(`variants/${variantIdNum}.json`, { variant: { id: variantIdNum, grams } });
 }
 
-/* ====== actualizar SKU + BARCODE en InventoryItem ====== */
 async function setInventorySku(inventoryItemId, sku, barcode) {
   const q = `
     mutation InvItemUpdate($id: ID!, $input: InventoryItemInput!) {
@@ -253,7 +213,6 @@ async function setInventorySku(inventoryItemId, sku, barcode) {
   if (e?.length) throw new Error(JSON.stringify(e));
 }
 
-/* ====== actualizar COSTO por InventoryItem (Costo por artículo) ====== */
 async function updateInventoryCost(inventoryItemId, cost) {
   if (!(cost > 0)) return;
   const q = `
@@ -267,9 +226,7 @@ async function updateInventoryCost(inventoryItemId, cost) {
 
 async function getAvailable(inventoryItemId, locationIdNum) {
   const iid = inventoryItemId.replace(/\D/g, "");
-  const d = await rest(
-    `inventory_levels.json?inventory_item_ids=${iid}&location_ids=${locationIdNum}`
-  );
+  const d = await rest(`inventory_levels.json?inventory_item_ids=${iid}&location_ids=${locationIdNum}`);
   return d.inventory_levels?.[0]?.available ?? 0;
 }
 
@@ -281,11 +238,7 @@ async function adjustInventory(inventoryItemId, location, targetQty) {
     mutation Adjust($input: InventoryAdjustQuantitiesInput!) {
       inventoryAdjustQuantities(input: $input) { userErrors { field message } }
     }`;
-  const input = {
-    name: "available",
-    reason: "correction",
-    changes: [{ inventoryItemId, locationId: location.gid, delta }],
-  };
+  const input = { name: "available", reason: "correction", changes: [{ inventoryItemId, locationId: location.gid, delta }] };
   const d = await gql(q, { input });
   const e = d.inventoryAdjustQuantities.userErrors;
   if (e?.length) throw new Error(JSON.stringify(e));
@@ -301,47 +254,17 @@ async function publishProduct(productId, publicationId) {
   if (e?.length) throw new Error(JSON.stringify(e));
 }
 
-/* ====== IMÁGENES (multi) PARA EXISTENTES ====== */
-async function getProductImageCountByGid(productGid) {
-  const productIdNum = Number(String(productGid).replace(/\D/g, ""));
-  const d = await rest(`products/${productIdNum}.json`);
-  return d?.product?.images?.length || 0;
+/* ================== IMÁGENES ================== */
+// HEAD rápido para validar si existe
+async function headOk(url) {
+  try {
+    await axios.head(url, { timeout: 6000, maxRedirects: 3, validateStatus: s => s >= 200 && s < 400 });
+    return true;
+  } catch { return false; }
 }
 
-async function addImagesToProduct(productGid, imageUrls = []) {
-  const productIdNum = Number(String(productGid).replace(/\D/g, ""));
-  let added = 0;
-  for (const src of imageUrls) {
-    try {
-      if (DEBUG) console.log(`Subiendo imagen → product ${productIdNum}:`, src);
-      await restPost(`products/${productIdNum}/images.json`, { image: { src } });
-      added++;
-      await wait(500); // suaviza rate limit
-    } catch (e) {
-      console.error("addImagesToProduct error:", src, e?.response?.data || e?.message || e);
-    }
-  }
-  if (DEBUG) console.log(`Imágenes añadidas: ${added}/${imageUrls.length} para ${productIdNum}`);
-}
-
-/* ================== MAPEO DESDE SYSCOM ================== */
-function pickPriceFromPrecios(precios) {
-  if (!precios || typeof precios !== "object") return 0;
-
-  for (const k of PRICE_PREF) {
-    if (k in precios) {
-      const val = firstNumber(precios[k]);
-      if (val > 0) return val;
-    }
-  }
-  const candidates = Object.values(precios)
-    .map(firstNumber)
-    .filter(n => n > 0);
-  return candidates.length ? Math.min(...candidates) : 0;
-}
-
-/* ===== Imágenes: recoge varias, conserva originales y añade variante "limpia" ===== */
-function normalizeImages(P) {
+// recoge varias, conserva originales y añade variante "limpia"
+function collectBasicImages(P) {
   const originals = [];
   const hires = [];
 
@@ -350,8 +273,6 @@ function normalizeImages(P) {
     const url = u.trim();
     if (!url) return;
     originals.push(url);
-
-    // Variante sin parámetros típicos de tamaño/calidad
     const cleaned = url.replace(/([?&](w|h|width|height|size|max|quality|q)[=][^&#]+)+/gi, "");
     if (cleaned && cleaned !== url) hires.push(cleaned);
   };
@@ -370,25 +291,75 @@ function normalizeImages(P) {
 
   if (Array.isArray(P.imagenes)) collect(P.imagenes);
   if (Array.isArray(P.fotos))    collect(P.fotos);
-
   if (typeof P.img_portada === "string") push(P.img_portada);
   if (typeof P.imagen === "string")      push(P.imagen);
   if (Array.isArray(P.galeria))          collect(P.galeria);
   if (Array.isArray(P.imagenes_url))     collect(P.imagenes_url);
 
   const uniq = (arr) => Array.from(new Set(arr));
-  const out = uniq([...originals, ...hires]);
-
-  return out.slice(0, MAX_IMAGES);
+  return uniq([...originals, ...hires]).slice(0, MAX_IMAGES);
 }
 
-function mapSyscomProduct(P, tc) {
-  // sku/título
+// genera “hermanas” …-0.jpg → …-1.jpg,…-8.jpg
+function guessSiblings(u) {
+  const out = [];
+  const m = u.match(/(.*?)([-_])0(\.[a-z]+)$/i);
+  if (!m) return out;
+  const [, base, sep, ext] = m;
+  for (let i = 1; i <= 8; i++) out.push(`${base}${sep}${i}${ext}`);
+  return out;
+}
+
+// pipeline completo: colecta, adivina hermanas y valida HEAD
+async function buildImageList(P) {
+  const base = collectBasicImages(P);
+  const want = new Set(base);
+
+  if (base.length < MAX_IMAGES) {
+    for (const u of base) {
+      for (const sib of guessSiblings(u)) {
+        if (want.size >= MAX_IMAGES) break;
+        want.add(sib);
+      }
+      if (want.size >= MAX_IMAGES) break;
+    }
+  }
+
+  // valida que existan
+  const list = Array.from(want).slice(0, MAX_IMAGES);
+  const results = await Promise.all(list.map(async (u) => (await headOk(u)) ? u : null));
+  const valid = results.filter(Boolean);
+  return valid.length ? valid : base.slice(0, MAX_IMAGES);
+}
+
+/* ================== MAPEO DESDE SYSCOM ================== */
+function pickPriceFromPrecios(precios) {
+  if (!precios || typeof precios !== "object") return 0;
+
+  // 1) preferencia explícita
+  for (const k of PRICE_PREF) {
+    if (k in precios) {
+      const val = firstNumber(precios[k]);
+      if (val >= PRICE_MIN) return val;
+    }
+  }
+
+  // 2) fallback: valores numéricos plausibles (>= PRICE_MIN)
+  const nums = Object.values(precios).map(firstNumber).filter(n => isFinite(n) && n >= PRICE_MIN);
+  if (nums.length) return Math.min(...nums);
+
+  // 3) fallback extremo: evita porcentajes [0..1]; toma el mayor valor restante
+  const notPerc = Object.values(precios).map(firstNumber).filter(n => isFinite(n) && n > 1);
+  if (notPerc.length) return Math.min(...notPerc);
+
+  return 0;
+}
+
+function mapSyscomProduct(P, tc, images) {
   const sku   = P.sku || P.codigo || P.clave || P.modelo;
   const title = P.nombre || P.titulo || P.descripcion_corta || P.descripcion;
   if (!sku || !title) return null;
 
-  // desc/marca/categoría
   const desc   = P.descripcion_html || P.descripcion || "";
   const vendor = (P.marca && (P.marca.nombre || P.marca)) || P.marca || P.fabricante || "";
   const ptype  =
@@ -396,35 +367,25 @@ function mapSyscomProduct(P, tc) {
     (P.categoria && (P.categoria.nombre || P.categoria)) ||
     "";
 
-  // precio base: costo proveedor = precio_con_descuento (o el más bajo disponible)
   const precios = P.precios || {};
-  let base = pickPriceFromPrecios(precios) ||
-             firstNumber(P.precio, P.precio_publico, P.precio_lista);
+  let base = pickPriceFromPrecios(precios) || firstNumber(P.precio, P.precio_publico, P.precio_lista);
 
-  // moneda de origen reportada por Syscom (si viene). Si no, asumimos la que pedimos.
-  const monedaOrigen =
-    (P.moneda || P.precios?.moneda || SYSCOM_CURRENCY).toString().toLowerCase();
+  const monedaOrigen = (P.moneda || P.precios?.moneda || SYSCOM_CURRENCY).toString().toLowerCase();
 
-  // convertir costo a MXN si viene en USD
   let costMXN = base;
   if (monedaOrigen === "usd") costMXN = base * (tc || 1);
 
-  // existencia/peso/imagenes/barcode
   const qty = firstNumber(P.existencia, P.stock, P.total_existencia);
   let weightKg = firstNumber(P.peso_kg, P.peso);
   if (weightKg > 100) weightKg = weightKg / 1000;
 
-  const images = normalizeImages(P);
+  const barcode = P.codigo_barras || P.codigo_barras_ean || P.ean || P.barcode || P.gtin || P.upc || null;
 
-  const barcode =
-    P.codigo_barras || P.codigo_barras_ean || P.ean || P.barcode || P.gtin || P.upc || null;
-
-  // precio final = costo_mxn × IVA × (1 + margen[20..25] %)
   const margin = pickMargin();
   const price  = round2(costMXN * IVA_RATE * (1 + margin));
 
   if (DEBUG) {
-    console.log(`SKU ${sku} | base:${base} ${monedaOrigen.toUpperCase()} | tc:${tc} | costMXN:${round2(costMXN)} | price:${price} | imgs:${images.length}`);
+    console.log(`SKU ${sku} | base:${base} ${monedaOrigen.toUpperCase()} | tc:${tc} | costMXN:${round2(costMXN)} | price:${price} | imgs:${images?.length || 0}`);
   }
 
   return {
@@ -434,9 +395,9 @@ function mapSyscomProduct(P, tc) {
     vendor: String(vendor),
     productType: String(ptype),
     cost: round2(costMXN),
-    price,                             // precio final calculado
+    price,
     available: Number(qty) || 0,
-    images,
+    images: images || [],
     barcode,
     weightKg: Number(weightKg) || 0,
   };
@@ -451,7 +412,7 @@ async function main() {
   const publicationId = await getPublicationId();
   const location      = await getLocation();
   const token         = await syscomToken();
-  const tc            = await getExchangeRate(token); // USD→MXN de Syscom
+  const tc            = await getExchangeRate(token);
 
   let created = 0, updated = 0, errors = 0;
 
@@ -463,7 +424,7 @@ async function main() {
         stock: (ONLY_STOCK ? 1 : 0),
         agrupar: 1,
         pagina: page,
-        moneda: SYSCOM_CURRENCY, // si el endpoint lo soporta, forzamos MXN
+        moneda: SYSCOM_CURRENCY,
       });
     } else {
       list = await sysget(token, `/productos`, {
@@ -471,16 +432,14 @@ async function main() {
         stock: (ONLY_STOCK ? 1 : 0),
         agrupar: 1,
         pagina: page,
-        moneda: SYSCOM_CURRENCY, // si el endpoint lo soporta, forzamos MXN
+        moneda: SYSCOM_CURRENCY,
       });
     }
 
     const productos = list?.data?.productos || list?.data || list?.productos || list;
 
     if (DEBUG) {
-      console.log(
-        `Página ${page}: ${Array.isArray(productos) ? productos.length : 0} productos`
-      );
+      console.log(`Página ${page}: ${Array.isArray(productos) ? productos.length : 0} productos`);
       if (Array.isArray(productos) && productos.length) {
         const first = productos[0]?.producto || productos[0]?.Producto || productos[0]?.item || productos[0]?.Item || productos[0];
         console.log("Keys ejemplo (nivel 1):", first ? Object.keys(first) : "sin items");
@@ -505,21 +464,20 @@ async function main() {
         const det = await sysget(token, `/productos/${pid}`, { moneda: SYSCOM_CURRENCY });
         const sp  = det.data || det;
 
-        // Log: claves relacionadas a imágenes que trae Syscom
         if (DEBUG) {
           const imgKeys = Object.keys(sp || {}).filter(k => /img|imagen|imagenes|fotos|galeria/i.test(k));
           console.log(`PID ${pid} → claves de imagen:`, imgKeys);
         }
 
-        const m = mapSyscomProduct(sp, tc);
-        if (DEBUG && m?.images) {
-          console.log(`PID ${pid} → imágenes encontradas (${m.images.length}):`, m.images.slice(0, 12));
-        }
+        // Construye lista de imágenes (básicas + “hermanas” validadas)
+        const images = await buildImageList(sp);
+        if (DEBUG) console.log(`PID ${pid} → imágenes encontradas/validadas (${images.length}):`, images.slice(0, 12));
+
+        const m = mapSyscomProduct(sp, tc, images);
         if (!m || !(m.cost > 0)) continue;
 
         const exists = await findVariantBySku(m.sku);
         if (exists) {
-          // Actualiza datos principales
           if (SET_PRICE) await updateVariantPrice(exists.product.id, exists.id, m.price);
           await updateVariantWeight(exists.id, m.weightKg);
           await setInventorySku(exists.inventoryItem.id, m.sku, m.barcode);
@@ -527,14 +485,10 @@ async function main() {
           await adjustInventory(exists.inventoryItem.id, location, m.available);
           await publishProduct(exists.product.id, publicationId);
 
-          // Añadir imágenes faltantes (hasta MAX_IMAGES)
           if (m.images?.length) {
             const imgCount = await getProductImageCountByGid(exists.product.id);
             if (imgCount < Math.min(MAX_IMAGES, m.images.length)) {
-              await addImagesToProduct(
-                exists.product.id,
-                m.images.slice(imgCount, MAX_IMAGES)
-              );
+              await addImagesToProduct(exists.product.id, m.images.slice(imgCount, MAX_IMAGES));
             }
           }
           updated++;
@@ -544,7 +498,7 @@ async function main() {
             descriptionHtml: m.descriptionHtml,
             vendor: m.vendor,
             productType: m.productType,
-            images: m.images, // intenta con media; si falla, fallback sin media
+            images: m.images,
           });
           if (SET_PRICE) await updateVariantPrice(res.productId, res.variantId, m.price);
           await updateVariantWeight(res.variantId, m.weightKg);
@@ -553,11 +507,9 @@ async function main() {
           await adjustInventory(res.inventoryItemId, location, m.available);
           await publishProduct(res.productId, publicationId);
 
-          // Si se creó sin media, anexa por REST
           if (!res.createdWithMedia && m.images?.length) {
             await addImagesToProduct(res.productId, m.images.slice(0, MAX_IMAGES));
           }
-          // Asegurar anexado de faltantes si mandaste >10
           if (m.images?.length > 10) {
             await addImagesToProduct(res.productId, m.images.slice(10, MAX_IMAGES));
           }
@@ -565,11 +517,7 @@ async function main() {
         }
       } catch (err) {
         errors++;
-        console.error(
-          "Error con producto",
-          p.id || p.producto_id || p.pid,
-          err?.response?.data || err?.message || err
-        );
+        console.error("Error con producto", p.id || p.producto_id || p.pid, err?.response?.data || err?.message || err);
       }
 
       await wait(SLEEP_MS);
