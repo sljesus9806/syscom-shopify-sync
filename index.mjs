@@ -72,7 +72,6 @@ async function sysget(token, path, params = {}) {
 async function getExchangeRate(token) {
   try {
     const d = await sysget(token, "/tipocambio");
-    // responses suelen venir como { normal: "xx.xx" }
     const tc = Number(d?.normal ?? d?.data?.normal ?? 1);
     return tc > 0 ? tc : 1;
   } catch {
@@ -314,11 +313,12 @@ async function addImagesToProduct(productGid, imageUrls = []) {
   let added = 0;
   for (const src of imageUrls) {
     try {
+      if (DEBUG) console.log(`Subiendo imagen → product ${productIdNum}:`, src);
       await restPost(`products/${productIdNum}/images.json`, { image: { src } });
       added++;
       await wait(500); // suaviza rate limit
     } catch (e) {
-      console.error("addImagesToProduct error:", e?.response?.data || e?.message || e);
+      console.error("addImagesToProduct error:", src, e?.response?.data || e?.message || e);
     }
   }
   if (DEBUG) console.log(`Imágenes añadidas: ${added}/${imageUrls.length} para ${productIdNum}`);
@@ -340,41 +340,46 @@ function pickPriceFromPrecios(precios) {
   return candidates.length ? Math.min(...candidates) : 0;
 }
 
-// ===== Imágenes: recoge varias y deduplica =====
+/* ===== Imágenes: recoge varias, conserva originales y añade variante "limpia" ===== */
 function normalizeImages(P) {
-  const urls = new Set();
+  const originals = [];
+  const hires = [];
 
-  const pushUrl = (u) => {
+  const push = (u) => {
     if (typeof u !== "string") return;
     const url = u.trim();
     if (!url) return;
-    // Limpieza rápida de miniaturas (?, ?w=100, ?h=100, etc.)
-    const cleaned = url.replace(/([?&](w|h|width|height|size|max)[=]\d+)+/gi, "");
-    urls.add(cleaned);
+    originals.push(url);
+
+    // Variante sin parámetros típicos de tamaño/calidad
+    const cleaned = url.replace(/([?&](w|h|width|height|size|max|quality|q)[=][^&#]+)+/gi, "");
+    if (cleaned && cleaned !== url) hires.push(cleaned);
   };
 
-  if (Array.isArray(P.imagenes)) {
-    for (const img of P.imagenes) {
-      if (typeof img === "string") pushUrl(img);
-      else if (img?.url)          pushUrl(img.url);
-      else if (img?.original)     pushUrl(img.original);
-      else if (img?.big)          pushUrl(img.big);
+  const collect = (arr) => {
+    for (const img of arr) {
+      if (typeof img === "string") { push(img); continue; }
+      if (!img || typeof img !== "object") continue;
+      if (img.url)       push(img.url);
+      if (img.original)  push(img.original);
+      if (img.big)       push(img.big);
+      if (img.hires)     push(img.hires);
+      if (img.src)       push(img.src);
     }
-  }
+  };
 
-  if (Array.isArray(P.fotos)) {
-    for (const img of P.fotos) {
-      if (typeof img === "string") pushUrl(img);
-      else if (img?.url)          pushUrl(img.url);
-      else if (img?.original)     pushUrl(img.original);
-      else if (img?.big)          pushUrl(img.big);
-    }
-  }
+  if (Array.isArray(P.imagenes)) collect(P.imagenes);
+  if (Array.isArray(P.fotos))    collect(P.fotos);
 
-  if (typeof P.img_portada === "string") pushUrl(P.img_portada);
-  if (typeof P.imagen === "string")      pushUrl(P.imagen);
+  if (typeof P.img_portada === "string") push(P.img_portada);
+  if (typeof P.imagen === "string")      push(P.imagen);
+  if (Array.isArray(P.galeria))          collect(P.galeria);
+  if (Array.isArray(P.imagenes_url))     collect(P.imagenes_url);
 
-  return Array.from(urls).slice(0, MAX_IMAGES);
+  const uniq = (arr) => Array.from(new Set(arr));
+  const out = uniq([...originals, ...hires]);
+
+  return out.slice(0, MAX_IMAGES);
 }
 
 function mapSyscomProduct(P, tc) {
@@ -500,7 +505,16 @@ async function main() {
         const det = await sysget(token, `/productos/${pid}`, { moneda: SYSCOM_CURRENCY });
         const sp  = det.data || det;
 
+        // Log: claves relacionadas a imágenes que trae Syscom
+        if (DEBUG) {
+          const imgKeys = Object.keys(sp || {}).filter(k => /img|imagen|imagenes|fotos|galeria/i.test(k));
+          console.log(`PID ${pid} → claves de imagen:`, imgKeys);
+        }
+
         const m = mapSyscomProduct(sp, tc);
+        if (DEBUG && m?.images) {
+          console.log(`PID ${pid} → imágenes encontradas (${m.images.length}):`, m.images.slice(0, 12));
+        }
         if (!m || !(m.cost > 0)) continue;
 
         const exists = await findVariantBySku(m.sku);
@@ -543,7 +557,7 @@ async function main() {
           if (!res.createdWithMedia && m.images?.length) {
             await addImagesToProduct(res.productId, m.images.slice(0, MAX_IMAGES));
           }
-          // (Opcional) asegurar anexado de faltantes si enviaste >10 en MAX_IMAGES
+          // Asegurar anexado de faltantes si mandaste >10
           if (m.images?.length > 10) {
             await addImagesToProduct(res.productId, m.images.slice(10, MAX_IMAGES));
           }
