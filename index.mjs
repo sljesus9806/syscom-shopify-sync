@@ -439,4 +439,121 @@ async function main() {
     let list;
 
     if (MODE === "brand") {
-      list = await sysget(token,
+      list = await sysget(token, `/marcas/${QUERY}/productos`, {
+        stock: (ONLY_STOCK ? 1 : 0), agrupar: 1, pagina: page, moneda: SYSCOM_CURRENCY,
+      });
+    } else {
+      list = await sysget(token, `/productos`, {
+        busqueda: QUERY, stock: (ONLY_STOCK ? 1 : 0), agrupar: 1, pagina: page, moneda: SYSCOM_CURRENCY,
+      });
+    }
+
+    const productos = list?.data?.productos || list?.data || list?.productos || list;
+
+    if (!Array.isArray(productos) || productos.length === 0) break;
+
+    if (DEBUG) {
+      console.log(`Página ${page}: ${Array.isArray(productos) ? productos.length : 0} productos`);
+      const first = productos[0]?.producto || productos[0]?.Producto || productos[0]?.item || productos[0]?.Item || productos[0];
+      console.log("Keys ejemplo (nivel 1):", first ? Object.keys(first) : "sin items");
+      try { console.log("Ejemplo JSON (recortado):", JSON.stringify(first).slice(0, 800)); } catch {}
+    }
+
+    for (const p of productos) {
+      try {
+        const row = p.producto || p.Producto || p.item || p.Item || p;
+
+        let pid = row.id || row.producto_id || row.id_producto || row.pid;
+        if (!pid) {
+          const u = row.url || row.link || row.href || "";
+          const m = typeof u === "string" ? u.match(/productos\/(\d+)/) : null;
+          if (m) pid = m[1];
+        }
+        if (!pid) { if (DEBUG) console.log("Sin pid en item:", Object.keys(row || {})); continue; }
+
+        const det = await sysget(token, `/productos/${pid}`, { moneda: SYSCOM_CURRENCY });
+        const sp  = det.data || det;
+
+        if (DEBUG) {
+          const imgKeys = Object.keys(sp || {}).filter(k => /img|imagen|imagenes|fotos|galeria/i.test(k));
+          console.log(`PID ${pid} → claves de imagen:`, imgKeys);
+        }
+
+        // Construye lista de imágenes (básicas + hermanas, sin HEAD)
+        const images = buildImageListNoHead(sp);
+        if (DEBUG) console.log(`PID ${pid} → imágenes para subir (${images.length}):`, images.slice(0, 12));
+
+        const m = mapSyscomProduct(sp, tc, images);
+        if (!m || !(m.cost > 0)) continue;
+
+        const exists = await findVariantBySku(m.sku);
+        if (exists) {
+          if (SET_PRICE) await updateVariantPrice(exists.product.id, exists.id, m.price);
+          await updateVariantWeight(exists.id, m.weightKg);
+          await setInventorySku(exists.inventoryItem.id, m.sku, m.barcode);
+          await updateInventoryCost(exists.inventoryItem.id, m.cost);
+          await adjustInventory(exists.inventoryItem.id, location, m.available);
+          await publishProduct(exists.product.id, publicationId);
+
+          // Anexar imágenes faltantes
+          if (m.images?.length) {
+            const imgCount = (await rest(`products/${String(exists.product.id).replace(/\D/g,"")}.json`))?.product?.images?.length || 0;
+            if (imgCount < Math.min(MAX_IMAGES, m.images.length)) {
+              const toAdd = m.images.slice(imgCount, MAX_IMAGES);
+              for (const src of toAdd) {
+                try {
+                  if (DEBUG) console.log("Subiendo imagen:", src);
+                  await restPost(`products/${String(exists.product.id).replace(/\D/g,"")}/images.json`, { image: { src } });
+                  await wait(400);
+                } catch (e) {
+                  console.error("add image error:", src, e?.response?.data || e?.message || e);
+                }
+              }
+            }
+          }
+          updated++;
+        } else {
+          const res = await productCreate({
+            title: m.title,
+            descriptionHtml: m.descriptionHtml,
+            vendor: m.vendor,
+            productType: m.productType,
+            images: m.images,
+          });
+          if (SET_PRICE) await updateVariantPrice(res.productId, res.variantId, m.price);
+          await updateVariantWeight(res.variantId, m.weightKg);
+          await setInventorySku(res.inventoryItemId, m.sku, m.barcode);
+          await updateInventoryCost(res.inventoryItemId, m.cost);
+          await adjustInventory(res.inventoryItemId, location, m.available);
+          await publishProduct(res.productId, publicationId);
+
+          if (!res.createdWithMedia && m.images?.length) {
+            for (const src of m.images.slice(0, MAX_IMAGES)) {
+              try {
+                if (DEBUG) console.log("Subiendo imagen (nuevo):", src);
+                await restPost(`products/${String(res.productId).replace(/\D/g,"")}/images.json`, { image: { src } });
+                await wait(400);
+              } catch (e) {
+                console.error("add image error:", src, e?.response?.data || e?.message || e);
+              }
+            }
+          }
+          created++;
+        }
+      } catch (err) {
+        errors++;
+        console.error("Error con producto", p.id || p.producto_id || p.pid, err?.response?.data || err?.message || err);
+      }
+
+      await wait(SLEEP_MS);
+    }
+  }
+
+  console.log(`Resumen => creados: ${created}, actualizados: ${updated}, errores: ${errors}`);
+}
+
+/* ================== ARRANQUE ================== */
+main().catch((e) => {
+  console.error(e?.response?.data || e?.message || e);
+  process.exit(1);
+});
