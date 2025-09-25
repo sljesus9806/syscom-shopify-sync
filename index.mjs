@@ -27,6 +27,9 @@ const MARGIN_MAX = Number(process.env.MARGIN_MAX || "0.25");
 // ¿También escribir el precio de venta en la variante?
 const SET_PRICE  = process.env.SET_PRICE !== "0";
 
+// Imágenes
+const MAX_IMAGES = parseInt(process.env.SYSCOM_MAX_IMAGES || "8", 10);
+
 /* ================== ENDPOINTS SYSCOM ================== */
 const SYS_OAUTH = "https://developers.syscom.mx/oauth/token";
 const SYS_BASE  = "https://developers.syscom.mx/api/v1";
@@ -115,6 +118,20 @@ async function restPut(path, payload) {
   return data;
 }
 
+async function restPost(path, payload) {
+  const { data } = await axios.post(
+    `https://${SHOP}.myshopify.com/admin/api/2025-07/${path}`,
+    payload,
+    {
+      headers: {
+        "X-Shopify-Access-Token": ADMIN_TOKEN,
+        "Content-Type": "application/json",
+      },
+    }
+  );
+  return data;
+}
+
 async function getPublicationId() {
   const q = `
     query {
@@ -148,7 +165,7 @@ async function findVariantBySku(sku) {
   return e.length ? e[0].node : null;
 }
 
-/* ====== crear producto con media opcional ====== */
+/* ====== crear producto con media opcional (varias imágenes) ====== */
 async function productCreate({ title, descriptionHtml, vendor, productType, images }) {
   const q = `
     mutation CreateProduct($product: ProductCreateInput!, $media: [CreateMediaInput!]) {
@@ -160,7 +177,7 @@ async function productCreate({ title, descriptionHtml, vendor, productType, imag
   const media = (images || [])
     .filter(Boolean)
     .map((u) => ({ originalSource: u }))
-    .slice(0, 10);
+    .slice(0, Math.min(MAX_IMAGES, 10));
 
   const product = {
     title,
@@ -267,6 +284,28 @@ async function publishProduct(productId, publicationId) {
   if (e?.length) throw new Error(JSON.stringify(e));
 }
 
+/* ====== IMÁGENES (multi) PARA EXISTENTES ====== */
+async function getProductImageCountByGid(productGid) {
+  const productIdNum = Number(String(productGid).replace(/\D/g, ""));
+  const d = await rest(`products/${productIdNum}.json`);
+  return d?.product?.images?.length || 0;
+}
+
+async function addImagesToProduct(productGid, imageUrls = []) {
+  const productIdNum = Number(String(productGid).replace(/\D/g, ""));
+  let added = 0;
+  for (const src of imageUrls) {
+    try {
+      await restPost(`products/${productIdNum}/images.json`, { image: { src } });
+      added++;
+      await wait(500); // suaviza rate limit
+    } catch (e) {
+      console.error("addImagesToProduct error:", e?.response?.data || e?.message || e);
+    }
+  }
+  if (DEBUG) console.log(`Imágenes añadidas: ${added}/${imageUrls.length} para ${productIdNum}`);
+}
+
 /* ================== MAPEO DESDE SYSCOM ================== */
 function pickPriceFromPrecios(precios) {
   if (!precios || typeof precios !== "object") return 0;
@@ -283,22 +322,41 @@ function pickPriceFromPrecios(precios) {
   return candidates.length ? Math.min(...candidates) : 0;
 }
 
+// ===== Imágenes: recoge varias y deduplica =====
 function normalizeImages(P) {
-  const images = [];
+  const urls = new Set();
+
+  const pushUrl = (u) => {
+    if (typeof u !== "string") return;
+    const url = u.trim();
+    if (!url) return;
+    // Limpieza rápida de miniaturas (?, ?w=100, ?h=100, etc.)
+    const cleaned = url.replace(/([?&](w|h|width|height|size|max)[=]\d+)+/gi, "");
+    urls.add(cleaned);
+  };
+
   if (Array.isArray(P.imagenes)) {
     for (const img of P.imagenes) {
-      if (typeof img === "string") { images.push(img); break; }
-      if (img?.url)               { images.push(img.url); break; }
+      if (typeof img === "string") pushUrl(img);
+      else if (img?.url)          pushUrl(img.url);
+      else if (img?.original)     pushUrl(img.original);
+      else if (img?.big)          pushUrl(img.big);
     }
-  } else if (Array.isArray(P.fotos)) {
-    for (const img of P.fotos) {
-      if (typeof img === "string") { images.push(img); break; }
-      if (img?.url)               { images.push(img.url); break; }
-    }
-  } else if (typeof P.img_portada === "string") {
-    images.push(P.img_portada);
   }
-  return images;
+
+  if (Array.isArray(P.fotos)) {
+    for (const img of P.fotos) {
+      if (typeof img === "string") pushUrl(img);
+      else if (img?.url)          pushUrl(img.url);
+      else if (img?.original)     pushUrl(img.original);
+      else if (img?.big)          pushUrl(img.big);
+    }
+  }
+
+  if (typeof P.img_portada === "string") pushUrl(P.img_portada);
+  if (typeof P.imagen === "string")      pushUrl(P.imagen);
+
+  return Array.from(urls).slice(0, MAX_IMAGES);
 }
 
 function mapSyscomProduct(P, tc) {
@@ -343,7 +401,7 @@ function mapSyscomProduct(P, tc) {
   const price  = round2(costMXN * IVA_RATE * (1 + margin));
 
   if (DEBUG) {
-    console.log(`SKU ${sku} | base:${base} ${monedaOrigen.toUpperCase()} | tc:${tc} | costMXN:${round2(costMXN)} | price:${price}`);
+    console.log(`SKU ${sku} | base:${base} ${monedaOrigen.toUpperCase()} | tc:${tc} | costMXN:${round2(costMXN)} | price:${price} | imgs:${images.length}`);
   }
 
   return {
@@ -429,12 +487,24 @@ async function main() {
 
         const exists = await findVariantBySku(m.sku);
         if (exists) {
+          // Actualiza datos principales
           if (SET_PRICE) await updateVariantPrice(exists.product.id, exists.id, m.price);
           await updateVariantWeight(exists.id, m.weightKg);
           await setInventorySku(exists.inventoryItem.id, m.sku, m.barcode);
           await updateInventoryCost(exists.inventoryItem.id, m.cost);
           await adjustInventory(exists.inventoryItem.id, location, m.available);
           await publishProduct(exists.product.id, publicationId);
+
+          // Añadir imágenes faltantes (hasta MAX_IMAGES)
+          if (m.images?.length) {
+            const imgCount = await getProductImageCountByGid(exists.product.id);
+            if (imgCount < Math.min(MAX_IMAGES, m.images.length)) {
+              await addImagesToProduct(
+                exists.product.id,
+                m.images.slice(imgCount, MAX_IMAGES)
+              );
+            }
+          }
           updated++;
         } else {
           const res = await productCreate({
@@ -442,7 +512,7 @@ async function main() {
             descriptionHtml: m.descriptionHtml,
             vendor: m.vendor,
             productType: m.productType,
-            images: m.images,
+            images: m.images, // ya respeta MAX_IMAGES internamente
           });
           if (SET_PRICE) await updateVariantPrice(res.productId, res.variantId, m.price);
           await updateVariantWeight(res.variantId, m.weightKg);
@@ -450,6 +520,11 @@ async function main() {
           await updateInventoryCost(res.inventoryItemId, m.cost);
           await adjustInventory(res.inventoryItemId, location, m.available);
           await publishProduct(res.productId, publicationId);
+
+          // (Opcional) asegurar anexado de faltantes si enviaste >10 en MAX_IMAGES
+          if (m.images?.length > 10) {
+            await addImagesToProduct(res.productId, m.images.slice(10, MAX_IMAGES));
+          }
           created++;
         }
       } catch (err) {
