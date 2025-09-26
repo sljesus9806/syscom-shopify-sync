@@ -27,3 +27,7 @@ jobs:
           SLEEP_MS:             ${{ secrets.SLEEP_MS }}
           DEBUG:               ${{ vars.DEBUG }}
           SYSCOM_ONLY_STOCK:   ${{ vars.SYSCOM_ONLY_STOCK }}
+          SYSCOM_MAX_IMAGES:    ${{ vars.SYSCOM_MAX_IMAGES }}
+          SYSCOM_PRICE_MIN:     ${{ vars.SYSCOM_PRICE_MIN }}
+          MARGIN_MIN:           ${{ vars.MARGIN_MIN }}
+          MARGIN_MAX:           ${{ vars.MARGIN_MAX }}
