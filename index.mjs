@@ -32,6 +32,7 @@ const PRICE_MIN  = Number(process.env.SYSCOM_PRICE_MIN || "50");
 // Feature flags
 const FTP_DIR_SCAN  = process.env.SYSCOM_FTP_DIR_SCAN  !== "0"; // on por defecto
 const SCRAPE_HTML   = process.env.SYSCOM_SCRAPE_HTML   !== "0"; // on por defecto
+const HEAD_CHECK    = process.env.SYSCOM_HEAD_CHECK    !== "0"; // valida URLs antes de subir
 
 /* ================== ENDPOINTS SYSCOM ================== */
 const SYS_OAUTH = "https://developers.syscom.mx/oauth/token";
@@ -271,6 +272,66 @@ async function publishProduct(productId, publicationId) {
 }
 
 /* ================== IMÁGENES ================== */
+/** Extensiones candidatas (se prueban si la original falla) */
+const EXT_CANDIDATES = [".PNG", ".png", ".JPG", ".jpg", ".WEBP", ".webp"];
+
+/** Encodea cada segmento del path; además fuerza %28 %29 para paréntesis */
+function encodePath(urlStr) {
+  try {
+    const u = new URL(urlStr);
+    u.pathname = u.pathname
+      .split("/")
+      .map(seg =>
+        seg
+          .replace(/\(/g, "%28")
+          .replace(/\)/g, "%29")
+          .replace(/ /g, "%20")
+      )
+      .join("/");
+    return u.toString();
+  } catch {
+    return urlStr;
+  }
+}
+
+/** HEAD robusto (devuelve true si 200..299) */
+async function headOk(url) {
+  try {
+    const r = await axios.head(url, { timeout: 10000, validateStatus: () => true });
+    if (DEBUG) console.log("HEAD", url, "→", r.status);
+    return r.status >= 200 && r.status < 300;
+  } catch (e) {
+    if (DEBUG) console.log("HEAD error", url, "→", e?.code || e?.message || "err");
+    return false;
+  }
+}
+
+/** Dado un URL, normaliza y prueba variantes de extensión hasta encontrar la primera alcanzable */
+async function firstReachable(url) {
+  if (!url) return null;
+
+  // 1) versión normalizada (encode de path)
+  const base = encodePath(url);
+  if (await headOk(base)) return base;
+
+  // 2) si tiene extensión, prueba mismas rutas con otras extensiones
+  let u;
+  try { u = new URL(base); } catch { return null; }
+  const m = u.pathname.match(/\.(png|jpe?g|webp)$/i);
+  const candidates = [];
+  if (m) {
+    const stem = u.pathname.slice(0, -m[0].length);
+    for (const ext of EXT_CANDIDATES) {
+      u.pathname = `${stem}${ext}`;
+      candidates.push(u.toString());
+    }
+  }
+  for (const c of candidates) {
+    if (await headOk(c)) return c;
+  }
+  return null;
+}
+
 // 1) Recoge portada + imagenes[] + colecciones alternativas y añade versión "limpia"
 function collectBasicImages(P) {
   const out = [];
@@ -363,16 +424,13 @@ function buildImageListNoHead(P) {
   return Array.from(want).slice(0, MAX_IMAGES);
 }
 
-/* === 4) NUEVO: Escaneo de directorio FTP para tomar TODAS las imágenes === */
-
-// Devuelve el directorio (URL) a partir de cualquier imagen: .../path/FILE -> .../path/
+/* === 4) Escaneo de directorio FTP === */
 function dirFromImageUrl(u) {
   if (typeof u !== "string") return "";
   const i = u.lastIndexOf("/");
   return i > 8 ? u.slice(0, i + 1) : "";
 }
 
-// Intenta construir https://ftp3.syscom.mx/.../{MARCA}/{SKU}/
 function buildFtpDirFromBrandSku(vendor, sku, host = "https://ftp3.syscom.mx") {
   if (!vendor || !sku) return "";
   const brand = String(vendor).toUpperCase().replace(/[^A-Z0-9]/g, "");
@@ -380,7 +438,6 @@ function buildFtpDirFromBrandSku(vendor, sku, host = "https://ftp3.syscom.mx") {
   return `${host}/usuarios/fotos/BancoFotografiasSyscom/${brand}/${skuSeg}/`;
 }
 
-// Lista imágenes *por HTML listing* del directorio
 async function listDirectoryImages(baseUrl, max = MAX_IMAGES) {
   if (!baseUrl) return [];
   try {
@@ -390,9 +447,7 @@ async function listDirectoryImages(baseUrl, max = MAX_IMAGES) {
     let m;
     while ((m = reHref.exec(html))) {
       const href = m[1];
-      if (!href) continue;
-      // ignora subcarpetas
-      if (href.endsWith("/")) continue;
+      if (!href || href.endsWith("/")) continue;
       if (!/\.(png|jpe?g|webp|gif)$/i.test(href)) continue;
       const abs = href.startsWith("http") ? href : baseUrl + href;
       out.add(abs);
@@ -407,20 +462,15 @@ async function listDirectoryImages(baseUrl, max = MAX_IMAGES) {
   }
 }
 
-// Intenta obtener imágenes del FTP usando:
-// 1) directorio de una portada/imagen conocida
-// 2) directorio armado por {MARCA}/{SKU}
 async function imagesFromFtpDirs(P, collected, max = MAX_IMAGES) {
   if (!FTP_DIR_SCAN) return [];
   const have = new Set(collected || []);
   const tryDirs = [];
 
-  // a) si ya tenemos una imagen, usa su carpeta
   const known = (collected && collected[0]) || P?.img_portada || P?.imagen;
   const knownDir = dirFromImageUrl(known);
   if (knownDir) tryDirs.push(knownDir);
 
-  // b) arma desde {MARCA}/{SKU}
   const sku = P.sku || P.codigo || P.clave || P.modelo;
   const hostFromKnown = known?.startsWith("http") ? known.split("/").slice(0, 3).join("/") : "https://ftp3.syscom.mx";
   const vendor = (P.marca && (P.marca.nombre || P.marca)) || P.marca || P.fabricante || "";
@@ -435,11 +485,10 @@ async function imagesFromFtpDirs(P, collected, max = MAX_IMAGES) {
     }
     if (have.size >= max) break;
   }
-
   return Array.from(have).slice(0, max);
 }
 
-/* === 5) Scraper de la página pública como último recurso === */
+/* === 5) Scraper de la página pública === */
 async function scrapeGalleryFromProductPage(P, max = MAX_IMAGES) {
   const pageUrl = P?.link || P?.url;
   if (!pageUrl || !SCRAPE_HTML) return [];
@@ -453,6 +502,20 @@ async function scrapeGalleryFromProductPage(P, max = MAX_IMAGES) {
     if (DEBUG) console.error("scrapeGalleryFromProductPage error:", e?.message || e);
     return [];
   }
+}
+
+/* === 6) Resolver y validar (HEAD) === */
+async function resolveValidImages(urls, limit = MAX_IMAGES) {
+  const out = [];
+  const seen = new Set();
+  for (const raw of urls) {
+    if (out.length >= limit) break;
+    if (!raw || seen.has(raw)) continue;
+    seen.add(raw);
+    const okUrl = HEAD_CHECK ? await firstReachable(raw) : encodePath(raw);
+    if (okUrl) out.push(okUrl);
+  }
+  return Array.from(new Set(out)).slice(0, limit);
 }
 
 /* ================== PRECIOS ================== */
@@ -631,6 +694,9 @@ async function main() {
             images = merged.slice(0, MAX_IMAGES);
           }
         }
+
+        // 4) Validar con HEAD/normalización (evita 404 por paréntesis/extensiones)
+        images = await resolveValidImages(images, MAX_IMAGES);
 
         if (DEBUG) console.log(`PID ${pid} → imágenes para subir (${images.length}):`, images.slice(0, 12));
 
