@@ -14,14 +14,14 @@ const SLEEP_MS  = parseInt(process.env.SLEEP_MS  || "900", 10);
 const DEBUG      = process.env.DEBUG === "1";
 const ONLY_STOCK = process.env.SYSCOM_ONLY_STOCK !== "0"; // true = solo con stock
 
-// Preferencia de campos de precio desde Syscom.precios (orden de preferencia)
-const PRICE_PREF = (process.env.SYSCOM_PRICE_PREF || "descuento,especial,oferta,precio,publico,lista,precio_con_descuento,precio_publico,precio_lista")
+// Preferencia de campos de precio (informativo; usamos pickDiscountedPrice)
+const PRICE_PREF = (process.env.SYSCOM_PRICE_PREF || "descuento,especial,oferta,precio,publico,lista,precio_descuentos,precio_especial")
   .split(",").map(s => s.trim()).filter(Boolean);
 
-// Moneda/IVA/margen
+// Moneda/IVA/margen (margen 15–25%)
 const SYSCOM_CURRENCY = (process.env.SYSCOM_CURRENCY || "mxn").toLowerCase();
 const IVA_RATE   = Number(process.env.IVA_RATE || "1.16");
-const MARGIN_MIN = Number(process.env.MARGIN_MIN || "0.20");
+const MARGIN_MIN = Number(process.env.MARGIN_MIN || "0.15");
 const MARGIN_MAX = Number(process.env.MARGIN_MAX || "0.25");
 
 const SET_PRICE  = process.env.SET_PRICE !== "0";
@@ -53,21 +53,16 @@ function money(val) {
   const hasComma = s.includes(",");
   const hasDot   = s.includes(".");
   if (hasComma && hasDot) {
-    // si el último separador es coma → coma decimal (EU)
     if (s.lastIndexOf(",") > s.lastIndexOf(".")) {
       s = s.replace(/\./g, "").replace(",", ".");
     } else {
-      // último es punto → punto decimal, quita comas miles
       s = s.replace(/,/g, "");
     }
   } else if (hasComma && !hasDot) {
-    // solo coma → probablemente decimal
     s = s.replace(/\./g, "").replace(",", ".");
   } else {
-    // solo punto → quita comas de miles
     s = s.replace(/,/g, "");
   }
-  // quita cualquier cosa que no sea dígito, punto o signo
   s = s.replace(/[^0-9.+-]/g, "");
   const n = Number(s);
   return isFinite(n) ? n : NaN;
@@ -285,275 +280,22 @@ async function publishProduct(productId, publicationId) {
 }
 
 /* ================== IMÁGENES ================== */
-// Toma varias del JSON, conserva originales y añade versión "limpia"
+// Toma portada + imagenes[] (ordenadas por 'orden') y añade versión "limpia"
 function collectBasicImages(P) {
-  const originals = [];
-  const hires = [];
+  const out = [];
 
   const push = (u) => {
     if (typeof u !== "string") return;
     const url = u.trim();
     if (!url) return;
-    originals.push(url);
+    out.push(url);
     const cleaned = url.replace(/([?&](w|h|width|height|size|max|quality|q)[=][^&#]+)+/gi, "");
-    if (cleaned && cleaned !== url) hires.push(cleaned);
+    if (cleaned && cleaned !== url) out.push(cleaned);
   };
 
-  const collect = (arr) => {
-    for (const img of arr) {
-      if (typeof img === "string") { push(img); continue; }
-      if (!img || typeof img !== "object") continue;
-      if (img.url)       push(img.url);
-      if (img.original)  push(img.original);
-      if (img.big)       push(img.big);
-      if (img.hires)     push(img.hires);
-      if (img.src)       push(img.src);
-    }
-  };
-
-  if (Array.isArray(P.imagenes)) collect(P.imagenes);
-  if (Array.isArray(P.fotos))    collect(P.fotos);
+  // 1) portada primero si existe
   if (typeof P.img_portada === "string") push(P.img_portada);
-  if (typeof P.imagen === "string")      push(P.imagen);
-  if (Array.isArray(P.galeria))          collect(P.galeria);
-  if (Array.isArray(P.imagenes_url))     collect(P.imagenes_url);
 
-  const uniq = (arr) => Array.from(new Set(arr));
-  return uniq([...originals, ...hires]).slice(0, MAX_IMAGES);
-}
-
-// Genera hermanas ...-0.jpg → ...-1.jpg..-8.jpg (sin validar con HEAD)
-function guessSiblings(u) {
-  const out = [];
-  const m = u.match(/(.*?)([-_])0(\.[a-z]+)$/i);
-  if (!m) return out;
-  const [, base, sep, ext] = m;
-  for (let i = 1; i <= 8; i++) out.push(`${base}${sep}${i}${ext}`);
-  return out;
-}
-
-function buildImageListNoHead(P) {
-  const base = collectBasicImages(P);
-  const want = new Set(base);
-  if (base.length < MAX_IMAGES) {
-    for (const u of base) {
-      for (const sib of guessSiblings(u)) {
-        if (want.size >= MAX_IMAGES) break;
-        want.add(sib);
-      }
-      if (want.size >= MAX_IMAGES) break;
-    }
-  }
-  return Array.from(want).slice(0, MAX_IMAGES);
-}
-
-/* ================== MAPEO DESDE SYSCOM ================== */
-function pickPriceFromPrecios(precios) {
-  if (!precios || typeof precios !== "object") return NaN;
-
-  // Preferencia explícita
-  for (const k of PRICE_PREF) {
-    if (k in precios) {
-      const v = money(precios[k]);
-      if (isFinite(v) && v >= PRICE_MIN) return v;
-    }
-  }
-
-  // Fallback: cualquier numérico >= PRICE_MIN
-  const nums = Object.values(precios).map(money).filter(n => isFinite(n) && n >= PRICE_MIN);
-  if (nums.length) return Math.min(...nums);
-
-  // Último recurso: evita porcentajes (0..1) y toma el menor >1
-  const notPerc = Object.values(precios).map(money).filter(n => isFinite(n) && n > 1);
-  if (notPerc.length) return Math.min(...notPerc);
-
-  return NaN;
-}
-
-function mapSyscomProduct(P, tc, images) {
-  const sku   = P.sku || P.codigo || P.clave || P.modelo;
-  const title = P.nombre || P.titulo || P.descripcion_corta || P.descripcion;
-  if (!sku || !title) return null;
-
-  const desc   = P.descripcion_html || P.descripcion || "";
-  const vendor = (P.marca && (P.marca.nombre || P.marca)) || P.marca || P.fabricante || "";
-  const ptype  =
-    (Array.isArray(P.categorias) && (P.categorias[0]?.nombre || P.categorias[0])) ||
-    (P.categoria && (P.categoria.nombre || P.categoria)) ||
-    "";
-
-  const precios = P.precios || {};
-  let base = pickPriceFromPrecios(precios);
-  if (!isFinite(base)) base = firstNumber(P.precio, P.precio_publico, P.precio_lista);
-
-  const monedaOrigen =
-    (P.moneda || P.precios?.moneda || SYSCOM_CURRENCY).toString().toLowerCase();
-
-  let costMXN = base;
-  if (monedaOrigen === "usd") costMXN = base * (tc || 1);
-
-  const qty = firstNumber(P.existencia, P.stock, P.total_existencia);
-  let weightKg = firstNumber(P.peso_kg, P.peso);
-  if (isFinite(weightKg) && weightKg > 100) weightKg = weightKg / 1000;
-
-  const barcode = P.codigo_barras || P.codigo_barras_ean || P.ean || P.barcode || P.gtin || P.upc || null;
-
-  const margin = pickMargin();
-  const price  = round2(costMXN * IVA_RATE * (1 + margin));
-
-  if (DEBUG) {
-    console.log("— PRECIOS RAW KEYS:", Object.keys(precios || {}));
-    try { console.log("— PRECIOS RAW JSON:", JSON.stringify(precios).slice(0, 300)); } catch {}
-    console.log(`SKU ${sku} | base:${base} ${monedaOrigen.toUpperCase()} | tc:${tc} | costMXN:${round2(costMXN)} | price:${price} | imgs:${images?.length || 0}`);
-  }
-
-  return {
-    sku: String(sku),
-    title: String(title),
-    descriptionHtml: String(desc),
-    vendor: String(vendor),
-    productType: String(ptype),
-    cost: round2(costMXN),
-    price,
-    available: Number(qty) || 0,
-    images: images || [],
-    barcode,
-    weightKg: isFinite(weightKg) ? Number(weightKg) : 0,
-  };
-}
-
-/* ================== MAIN ================== */
-async function main() {
-  if (!SHOP || !ADMIN_TOKEN || !SYSCOM_CLIENT_ID || !SYSCOM_CLIENT_SECRET) {
-    throw new Error("Faltan variables de entorno obligatorias");
-  }
-
-  const publicationId = await getPublicationId();
-  const location      = await getLocation();
-  const token         = await syscomToken();
-  const tc            = await getExchangeRate(token);
-
-  let created = 0, updated = 0, errors = 0;
-
-  for (let page = 1; page <= RUN_PAGES; page++) {
-    let list;
-
-    if (MODE === "brand") {
-      list = await sysget(token, `/marcas/${QUERY}/productos`, {
-        stock: (ONLY_STOCK ? 1 : 0), agrupar: 1, pagina: page, moneda: SYSCOM_CURRENCY,
-      });
-    } else {
-      list = await sysget(token, `/productos`, {
-        busqueda: QUERY, stock: (ONLY_STOCK ? 1 : 0), agrupar: 1, pagina: page, moneda: SYSCOM_CURRENCY,
-      });
-    }
-
-    const productos = list?.data?.productos || list?.data || list?.productos || list;
-
-    if (!Array.isArray(productos) || productos.length === 0) break;
-
-    if (DEBUG) {
-      console.log(`Página ${page}: ${Array.isArray(productos) ? productos.length : 0} productos`);
-      const first = productos[0]?.producto || productos[0]?.Producto || productos[0]?.item || productos[0]?.Item || productos[0];
-      console.log("Keys ejemplo (nivel 1):", first ? Object.keys(first) : "sin items");
-      try { console.log("Ejemplo JSON (recortado):", JSON.stringify(first).slice(0, 800)); } catch {}
-    }
-
-    for (const p of productos) {
-      try {
-        const row = p.producto || p.Producto || p.item || p.Item || p;
-
-        let pid = row.id || row.producto_id || row.id_producto || row.pid;
-        if (!pid) {
-          const u = row.url || row.link || row.href || "";
-          const m = typeof u === "string" ? u.match(/productos\/(\d+)/) : null;
-          if (m) pid = m[1];
-        }
-        if (!pid) { if (DEBUG) console.log("Sin pid en item:", Object.keys(row || {})); continue; }
-
-        const det = await sysget(token, `/productos/${pid}`, { moneda: SYSCOM_CURRENCY });
-        const sp  = det.data || det;
-
-        if (DEBUG) {
-          const imgKeys = Object.keys(sp || {}).filter(k => /img|imagen|imagenes|fotos|galeria/i.test(k));
-          console.log(`PID ${pid} → claves de imagen:`, imgKeys);
-        }
-
-        // Construye lista de imágenes (básicas + hermanas, sin HEAD)
-        const images = buildImageListNoHead(sp);
-        if (DEBUG) console.log(`PID ${pid} → imágenes para subir (${images.length}):`, images.slice(0, 12));
-
-        const m = mapSyscomProduct(sp, tc, images);
-        if (!m || !(m.cost > 0)) continue;
-
-        const exists = await findVariantBySku(m.sku);
-        if (exists) {
-          if (SET_PRICE) await updateVariantPrice(exists.product.id, exists.id, m.price);
-          await updateVariantWeight(exists.id, m.weightKg);
-          await setInventorySku(exists.inventoryItem.id, m.sku, m.barcode);
-          await updateInventoryCost(exists.inventoryItem.id, m.cost);
-          await adjustInventory(exists.inventoryItem.id, location, m.available);
-          await publishProduct(exists.product.id, publicationId);
-
-          // Anexar imágenes faltantes
-          if (m.images?.length) {
-            const imgCount = (await rest(`products/${String(exists.product.id).replace(/\D/g,"")}.json`))?.product?.images?.length || 0;
-            if (imgCount < Math.min(MAX_IMAGES, m.images.length)) {
-              const toAdd = m.images.slice(imgCount, MAX_IMAGES);
-              for (const src of toAdd) {
-                try {
-                  if (DEBUG) console.log("Subiendo imagen:", src);
-                  await restPost(`products/${String(exists.product.id).replace(/\D/g,"")}/images.json`, { image: { src } });
-                  await wait(400);
-                } catch (e) {
-                  console.error("add image error:", src, e?.response?.data || e?.message || e);
-                }
-              }
-            }
-          }
-          updated++;
-        } else {
-          const res = await productCreate({
-            title: m.title,
-            descriptionHtml: m.descriptionHtml,
-            vendor: m.vendor,
-            productType: m.productType,
-            images: m.images,
-          });
-          if (SET_PRICE) await updateVariantPrice(res.productId, res.variantId, m.price);
-          await updateVariantWeight(res.variantId, m.weightKg);
-          await setInventorySku(res.inventoryItemId, m.sku, m.barcode);
-          await updateInventoryCost(res.inventoryItemId, m.cost);
-          await adjustInventory(res.inventoryItemId, location, m.available);
-          await publishProduct(res.productId, publicationId);
-
-          if (!res.createdWithMedia && m.images?.length) {
-            for (const src of m.images.slice(0, MAX_IMAGES)) {
-              try {
-                if (DEBUG) console.log("Subiendo imagen (nuevo):", src);
-                await restPost(`products/${String(res.productId).replace(/\D/g,"")}/images.json`, { image: { src } });
-                await wait(400);
-              } catch (e) {
-                console.error("add image error:", src, e?.response?.data || e?.message || e);
-              }
-            }
-          }
-          created++;
-        }
-      } catch (err) {
-        errors++;
-        console.error("Error con producto", p.id || p.producto_id || p.pid, err?.response?.data || err?.message || err);
-      }
-
-      await wait(SLEEP_MS);
-    }
-  }
-
-  console.log(`Resumen => creados: ${created}, actualizados: ${updated}, errores: ${errors}`);
-}
-
-/* ================== ARRANQUE ================== */
-main().catch((e) => {
-  console.error(e?.response?.data || e?.message || e);
-  process.exit(1);
-});
+  // 2) imagenes[] del schema (objetos {orden, url})
+  if (Array.isArray(P.imagenes)) {
+    const arr =
